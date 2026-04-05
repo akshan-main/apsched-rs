@@ -19,6 +19,7 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register store classes
     m.add_class::<stores::PyMemoryJobStore>()?;
+    m.add_class::<stores::PySqlJobStore>()?;
 
     // Register executor classes
     m.add_class::<executors::PyThreadPoolExecutor>()?;

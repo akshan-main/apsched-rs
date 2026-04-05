@@ -18,12 +18,98 @@ use apsched_core::model::{JobOutcome, JobResultEnvelope, JobSpec};
 use apsched_core::traits::{Executor, JobStore, Trigger};
 use apsched_core::SchedulerEngine;
 use apsched_store::MemoryJobStore;
+use apsched_store::SqlJobStore;
 
 use crate::convert::{
     datetime_to_py, deserialize_py_args, py_to_datetime, resolve_callable,
     scheduler_error_to_pyerr, serialize_py_args,
 };
 use crate::triggers::{PyCalendarIntervalTrigger, PyCronTrigger, PyDateTrigger, PyIntervalTrigger};
+
+// ---------------------------------------------------------------------------
+// Pending store: holds store config to be materialized at scheduler start
+// ---------------------------------------------------------------------------
+
+/// A store that has been configured but not yet bound to a tokio runtime.
+/// SQL stores must be created within the scheduler's runtime to avoid
+/// connection pool runtime-binding issues.
+enum PendingStore {
+    Memory(Arc<MemoryJobStore>),
+    Sql { url: String, tablename: String },
+}
+
+impl PendingStore {
+    /// Materialize the store within the given tokio runtime.
+    fn into_store(self, rt: &tokio::runtime::Runtime) -> PyResult<Arc<dyn JobStore>> {
+        match self {
+            PendingStore::Memory(store) => Ok(store as Arc<dyn JobStore>),
+            PendingStore::Sql { url, tablename } => {
+                let store = rt
+                    .block_on(SqlJobStore::new(&url, Some(&tablename)))
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("Failed to create SQL store: {}", e))
+                    })?;
+                Ok(Arc::new(store) as Arc<dyn JobStore>)
+            }
+        }
+    }
+}
+
+/// Parse a jobstore argument from Python into a PendingStore.
+///
+/// Supports:
+/// - `PyMemoryJobStore` instances
+/// - `PySqlJobStore` instances (url/tablename config)
+/// - String aliases: `"memory"`, `"sqlite"`, `"sqlalchemy"` (the latter two
+///   require a `url` kwarg)
+fn parse_jobstore(
+    jobstore: &Bound<'_, PyAny>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<PendingStore> {
+    // Try PyMemoryJobStore
+    if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>() {
+        return Ok(PendingStore::Memory(Arc::clone(&py_store.inner)));
+    }
+    // Try PySqlJobStore (holds url/tablename config)
+    if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PySqlJobStore>>() {
+        return Ok(PendingStore::Sql {
+            url: py_store.url.clone(),
+            tablename: py_store.tablename.clone(),
+        });
+    }
+    // Try string alias
+    if let Ok(alias_str) = jobstore.extract::<String>() {
+        match alias_str.as_str() {
+            "memory" => {
+                return Ok(PendingStore::Memory(Arc::new(MemoryJobStore::new())));
+            }
+            "sqlite" | "sqlalchemy" => {
+                let url = kwargs
+                    .and_then(|kw| kw.get_item("url").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .ok_or_else(|| {
+                        PyValueError::new_err(
+                            "A 'url' keyword argument is required for sqlite/sqlalchemy stores",
+                        )
+                    })?;
+                let tablename = kwargs
+                    .and_then(|kw| kw.get_item("tablename").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_else(|| "apscheduler_jobs".to_string());
+                return Ok(PendingStore::Sql { url, tablename });
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown jobstore type: '{}'. Use 'memory', 'sqlite', or 'sqlalchemy'",
+                    other
+                )));
+            }
+        }
+    }
+    Err(PyTypeError::new_err(
+        "jobstore must be a MemoryJobStore, SqlJobStore, or a string alias ('memory', 'sqlite', 'sqlalchemy')",
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Callable store: holds Python callable objects that can't be serialized
@@ -720,6 +806,7 @@ pub struct PyBlockingScheduler {
     config: SchedulerConfig,
     pending_jobs: Vec<PendingJob>,
     stores: HashMap<String, PyObject>,
+    pending_stores: HashMap<String, PendingStore>,
     executors: HashMap<String, PyObject>,
     listeners: Vec<(PyObject, u32)>,
     started: bool,
@@ -782,6 +869,7 @@ impl PyBlockingScheduler {
             config,
             pending_jobs: Vec::new(),
             stores: HashMap::new(),
+            pending_stores: HashMap::new(),
             executors: HashMap::new(),
             listeners: Vec::new(),
             started: false,
@@ -825,13 +913,20 @@ impl PyBlockingScheduler {
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add user-configured stores
+        // Add user-configured stores (pending stores, materialized with this runtime)
+        for (alias, pending) in self.pending_stores.drain() {
+            let store = pending.into_store(&rt)?;
+            engine
+                .add_jobstore(store, &alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        // Also try stores registered as Python objects
         for (alias, store_obj) in &self.stores {
             let store_obj_bound = store_obj.bind(py);
-            if let Ok(py_store) = store_obj_bound.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>()
-            {
+            if let Ok(pending) = parse_jobstore(&store_obj_bound, None) {
+                let store = pending.into_store(&rt)?;
                 engine
-                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, alias)
+                    .add_jobstore(store, alias)
                     .map_err(scheduler_error_to_pyerr)?;
             }
         }
@@ -1378,15 +1473,21 @@ impl PyBlockingScheduler {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
         let alias = alias.unwrap_or("default").to_string();
-        self.stores
-            .insert(alias.clone(), jobstore.clone().unbind());
+        let pending = parse_jobstore(jobstore, kwargs)?;
 
         if let Some(ref engine) = self.engine {
-            if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>() {
-                engine
-                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, &alias)
-                    .map_err(scheduler_error_to_pyerr)?;
-            }
+            // Engine is running; we need a runtime to materialize SQL stores.
+            // Use a temporary runtime for immediate registration.
+            let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to create runtime: {}", e))
+            })?;
+            let store = pending.into_store(&rt)?;
+            engine
+                .add_jobstore(store, &alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        } else {
+            // Store for deferred creation at start time
+            self.pending_stores.insert(alias.clone(), pending);
         }
 
         Ok(())
@@ -1394,6 +1495,7 @@ impl PyBlockingScheduler {
 
     fn remove_jobstore(&mut self, alias: &str) -> PyResult<()> {
         self.stores.remove(alias);
+        self.pending_stores.remove(alias);
         if let Some(ref engine) = self.engine {
             engine
                 .remove_jobstore(alias)
@@ -1477,6 +1579,7 @@ pub struct PyBackgroundScheduler {
     config: SchedulerConfig,
     pending_jobs: Vec<PendingJob>,
     stores: HashMap<String, PyObject>,
+    pending_stores: HashMap<String, PendingStore>,
     executors: HashMap<String, PyObject>,
     listeners: Vec<(PyObject, u32)>,
     started: bool,
@@ -1540,6 +1643,7 @@ impl PyBackgroundScheduler {
             config,
             pending_jobs: Vec::new(),
             stores: HashMap::new(),
+            pending_stores: HashMap::new(),
             executors: HashMap::new(),
             listeners: Vec::new(),
             started: false,
@@ -1588,13 +1692,20 @@ impl PyBackgroundScheduler {
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add user stores
+        // Add user stores (pending stores, materialized with this runtime)
+        for (alias, pending) in self.pending_stores.drain() {
+            let store = pending.into_store(&rt)?;
+            engine
+                .add_jobstore(store, &alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        // Also try stores registered as Python objects
         for (alias, store_obj) in &self.stores {
             let store_obj_bound = store_obj.bind(py);
-            if let Ok(py_store) = store_obj_bound.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>()
-            {
+            if let Ok(pending) = parse_jobstore(&store_obj_bound, None) {
+                let store = pending.into_store(&rt)?;
                 engine
-                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, alias)
+                    .add_jobstore(store, alias)
                     .map_err(scheduler_error_to_pyerr)?;
             }
         }
@@ -2131,15 +2242,20 @@ impl PyBackgroundScheduler {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
         let alias = alias.unwrap_or("default").to_string();
-        self.stores
-            .insert(alias.clone(), jobstore.clone().unbind());
+        let pending = parse_jobstore(jobstore, kwargs)?;
 
         if let Some(ref engine) = self.engine {
-            if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>() {
-                engine
-                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, &alias)
-                    .map_err(scheduler_error_to_pyerr)?;
-            }
+            // Engine is running; use the scheduler's own runtime
+            let rt_ref = self.runtime.as_ref().ok_or_else(|| {
+                PyRuntimeError::new_err("Scheduler runtime not available")
+            })?;
+            let store = pending.into_store(rt_ref)?;
+            engine
+                .add_jobstore(store, &alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        } else {
+            // Store for deferred creation at start time
+            self.pending_stores.insert(alias.clone(), pending);
         }
 
         Ok(())
@@ -2147,6 +2263,7 @@ impl PyBackgroundScheduler {
 
     fn remove_jobstore(&mut self, alias: &str) -> PyResult<()> {
         self.stores.remove(alias);
+        self.pending_stores.remove(alias);
         if let Some(ref engine) = self.engine {
             engine
                 .remove_jobstore(alias)
@@ -2230,6 +2347,7 @@ pub struct PyAsyncIOScheduler {
     config: SchedulerConfig,
     pending_jobs: Vec<PendingJob>,
     stores: HashMap<String, PyObject>,
+    pending_stores: HashMap<String, PendingStore>,
     executors: HashMap<String, PyObject>,
     listeners: Vec<(PyObject, u32)>,
     started: bool,
@@ -2285,6 +2403,7 @@ impl PyAsyncIOScheduler {
             config,
             pending_jobs: Vec::new(),
             stores: HashMap::new(),
+            pending_stores: HashMap::new(),
             executors: HashMap::new(),
             listeners: Vec::new(),
             started: false,
@@ -2318,6 +2437,24 @@ impl PyAsyncIOScheduler {
         engine
             .add_jobstore(default_store, "default")
             .map_err(scheduler_error_to_pyerr)?;
+
+        // Add user stores (pending stores, materialized with this runtime)
+        for (alias, pending) in self.pending_stores.drain() {
+            let store = pending.into_store(&rt)?;
+            engine
+                .add_jobstore(store, &alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        // Also try stores registered as Python objects
+        for (alias, store_obj) in &self.stores {
+            let store_obj_bound = store_obj.bind(py);
+            if let Ok(pending) = parse_jobstore(&store_obj_bound, None) {
+                let store = pending.into_store(&rt)?;
+                engine
+                    .add_jobstore(store, alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
 
         // Capture the running asyncio event loop so async callables can be
         // scheduled on it from worker threads.
