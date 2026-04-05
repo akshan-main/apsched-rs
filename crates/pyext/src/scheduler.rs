@@ -13,7 +13,9 @@ use apsched_core::model::{
     CallableRef, CoalescePolicy, ScheduleSpec, SchedulerConfig, SerializedValue, TaskSpec,
     TriggerState,
 };
-use apsched_core::traits::{JobStore, Trigger};
+use apsched_core::error::ExecutorError;
+use apsched_core::model::{JobOutcome, JobResultEnvelope, JobSpec};
+use apsched_core::traits::{Executor, JobStore, Trigger};
 use apsched_core::SchedulerEngine;
 use apsched_store::MemoryJobStore;
 
@@ -53,6 +55,123 @@ impl CallableStore {
     #[allow(dead_code)]
     fn remove(&self, id: u64) -> Option<PyObject> {
         self.callables.write().remove(&id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Python-aware executor: actually calls Python callables via the GIL
+// ---------------------------------------------------------------------------
+
+struct PythonAwareExecutor {
+    callable_store: Arc<CallableStore>,
+    max_workers: usize,
+    running_count: Arc<std::sync::atomic::AtomicU32>,
+    started: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::fmt::Debug for PythonAwareExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonAwareExecutor")
+            .field("max_workers", &self.max_workers)
+            .finish()
+    }
+}
+
+impl PythonAwareExecutor {
+    fn new(callable_store: Arc<CallableStore>, max_workers: usize) -> Self {
+        Self {
+            callable_store,
+            max_workers,
+            running_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Executor for PythonAwareExecutor {
+    async fn start(&self) -> Result<(), ExecutorError> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn shutdown(&self, _wait: bool) -> Result<(), ExecutorError> {
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.started
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn submit_job(
+        &self,
+        job: JobSpec,
+        result_tx: tokio::sync::mpsc::Sender<JobResultEnvelope>,
+    ) -> Result<(), ExecutorError> {
+        if self
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(ExecutorError::ShutdownInProgress);
+        }
+        if !self.started.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ExecutorError::NotStarted);
+        }
+
+        let current = self
+            .running_count
+            .load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if current >= self.max_workers {
+            return Err(ExecutorError::PoolExhausted);
+        }
+
+        self.running_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let running_count = Arc::clone(&self.running_count);
+        let callable_store = Arc::clone(&self.callable_store);
+        let job_id = job.id;
+        let schedule_id = job.schedule_id.clone();
+        let task = job.task.clone();
+
+        tokio::spawn(async move {
+            let outcome = Python::with_gil(|py| {
+                match run_python_callable(
+                    py,
+                    &task.callable_ref,
+                    &callable_store,
+                    &task.args,
+                    &task.kwargs,
+                ) {
+                    Ok(_) => JobOutcome::Success,
+                    Err(e) => JobOutcome::Error(format!("{}", e)),
+                }
+            });
+
+            let envelope = JobResultEnvelope {
+                job_id,
+                schedule_id,
+                outcome,
+                completed_at: chrono::Utc::now(),
+            };
+
+            let _ = result_tx.send(envelope).await;
+            running_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        Ok(())
+    }
+
+    async fn running_job_count(&self) -> usize {
+        self.running_count
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
+    }
+
+    fn executor_type(&self) -> &'static str {
+        "python_threadpool"
     }
 }
 
@@ -208,7 +327,15 @@ fn parse_trigger(
                         a.get_item(key)
                             .ok()
                             .flatten()
-                            .and_then(|v| v.extract::<String>().ok())
+                            .map(|v| {
+                                if let Ok(s) = v.extract::<String>() {
+                                    s
+                                } else if let Ok(i) = v.extract::<i64>() {
+                                    i.to_string()
+                                } else {
+                                    v.str().map(|s| s.to_string()).unwrap_or_default()
+                                }
+                            })
                     })
                 };
                 let year = get_str("year");
@@ -374,8 +501,17 @@ fn build_schedule_spec(
     }
 
     // Parse trigger
+    // APScheduler compatibility: when trigger is a string and trigger_args is
+    // not provided, the trigger parameters (seconds, minutes, hour, etc.) are
+    // passed as **kwargs alongside other schedule params like id/name.  Merge
+    // kwargs into trigger_args so parse_trigger can find them.
+    let effective_trigger_args: Option<Bound<'_, PyDict>> = if trigger_args.is_some() {
+        trigger_args.cloned()
+    } else {
+        kwargs.cloned()
+    };
     let rust_trigger: Box<dyn Trigger> = if let Some(trig) = trigger {
-        parse_trigger(py, trig, trigger_args)?
+        parse_trigger(py, trig, effective_trigger_args.as_ref())?
     } else {
         // Default: date trigger (run now)
         let dt = Utc::now();
@@ -634,8 +770,11 @@ impl PyBlockingScheduler {
             .add_jobstore(default_store, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add default executor
-        let default_executor = Arc::new(apsched_executors::ThreadPoolExecutor::new(10));
+        // Add default executor (Python-aware so it can invoke Python callables)
+        let default_executor = Arc::new(PythonAwareExecutor::new(
+            Arc::clone(&callable_store),
+            10,
+        ));
         engine
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;
@@ -657,8 +796,10 @@ impl PyBlockingScheduler {
             if let Ok(py_exec) =
                 exec_obj_bound.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
             {
-                let executor =
-                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                let executor = Arc::new(PythonAwareExecutor::new(
+                    Arc::clone(&callable_store),
+                    py_exec.max_workers,
+                ));
                 engine
                     .add_executor(executor, alias)
                     .map_err(scheduler_error_to_pyerr)?;
@@ -1231,8 +1372,10 @@ impl PyBlockingScheduler {
             if let Ok(py_exec) =
                 executor.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
             {
-                let exec =
-                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                let exec = Arc::new(PythonAwareExecutor::new(
+                    Arc::clone(&self.callable_store),
+                    py_exec.max_workers,
+                ));
                 engine
                     .add_executor(exec, &alias)
                     .map_err(scheduler_error_to_pyerr)?;
@@ -1389,8 +1532,12 @@ impl PyBackgroundScheduler {
             .add_jobstore(default_store, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add default executor
-        let default_executor = Arc::new(apsched_executors::ThreadPoolExecutor::new(10));
+        // Add default executor (Python-aware so it can invoke Python callables)
+        let callable_store = Arc::clone(&self.callable_store);
+        let default_executor = Arc::new(PythonAwareExecutor::new(
+            Arc::clone(&callable_store),
+            10,
+        ));
         engine
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;
@@ -1412,8 +1559,10 @@ impl PyBackgroundScheduler {
             if let Ok(py_exec) =
                 exec_obj_bound.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
             {
-                let executor =
-                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                let executor = Arc::new(PythonAwareExecutor::new(
+                    Arc::clone(&callable_store),
+                    py_exec.max_workers,
+                ));
                 engine
                     .add_executor(executor, alias)
                     .map_err(scheduler_error_to_pyerr)?;
@@ -1831,8 +1980,10 @@ impl PyBackgroundScheduler {
             if let Ok(py_exec) =
                 executor.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
             {
-                let exec =
-                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                let exec = Arc::new(PythonAwareExecutor::new(
+                    Arc::clone(&self.callable_store),
+                    py_exec.max_workers,
+                ));
                 engine
                     .add_executor(exec, &alias)
                     .map_err(scheduler_error_to_pyerr)?;
@@ -1977,8 +2128,12 @@ impl PyAsyncIOScheduler {
             .add_jobstore(default_store, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add default executor
-        let default_executor = Arc::new(apsched_executors::ThreadPoolExecutor::new(10));
+        // Add default executor (Python-aware)
+        let callable_store = Arc::clone(&self.callable_store);
+        let default_executor = Arc::new(PythonAwareExecutor::new(
+            Arc::clone(&callable_store),
+            10,
+        ));
         engine
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;

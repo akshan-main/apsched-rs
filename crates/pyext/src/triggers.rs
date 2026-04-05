@@ -143,19 +143,39 @@ impl PyCronTrigger {
     #[new]
     #[pyo3(signature = (year=None, month=None, day=None, week=None, day_of_week=None, hour=None, minute=None, second=None, start_date=None, end_date=None, timezone=None, jitter=None))]
     fn new(
-        year: Option<&str>,
-        month: Option<&str>,
-        day: Option<&str>,
-        week: Option<&str>,
-        day_of_week: Option<&str>,
-        hour: Option<&str>,
-        minute: Option<&str>,
-        second: Option<&str>,
+        year: Option<&Bound<'_, PyAny>>,
+        month: Option<&Bound<'_, PyAny>>,
+        day: Option<&Bound<'_, PyAny>>,
+        week: Option<&Bound<'_, PyAny>>,
+        day_of_week: Option<&Bound<'_, PyAny>>,
+        hour: Option<&Bound<'_, PyAny>>,
+        minute: Option<&Bound<'_, PyAny>>,
+        second: Option<&Bound<'_, PyAny>>,
         start_date: Option<&Bound<'_, PyAny>>,
         end_date: Option<&Bound<'_, PyAny>>,
         timezone: Option<&str>,
         jitter: Option<f64>,
     ) -> PyResult<Self> {
+        // Helper: accept both str and int for cron fields, converting int to str
+        fn pyany_to_cron_str(obj: Option<&Bound<'_, PyAny>>) -> Option<String> {
+            obj.map(|v| {
+                if let Ok(s) = v.extract::<String>() {
+                    s
+                } else if let Ok(i) = v.extract::<i64>() {
+                    i.to_string()
+                } else {
+                    v.str().map(|s| s.to_string()).unwrap_or_default()
+                }
+            })
+        }
+        let year_s = pyany_to_cron_str(year);
+        let month_s = pyany_to_cron_str(month);
+        let day_s = pyany_to_cron_str(day);
+        let week_s = pyany_to_cron_str(week);
+        let day_of_week_s = pyany_to_cron_str(day_of_week);
+        let hour_s = pyany_to_cron_str(hour);
+        let minute_s = pyany_to_cron_str(minute);
+        let second_s = pyany_to_cron_str(second);
         let tz = timezone.unwrap_or("UTC").to_string();
         let sd = match start_date {
             Some(obj) => Some(py_to_datetime(obj)?),
@@ -166,7 +186,15 @@ impl PyCronTrigger {
             None => None,
         };
         let trigger = CronTrigger::new(
-            year, month, day, week, day_of_week, hour, minute, second, sd, ed, tz, jitter,
+            year_s.as_deref(),
+            month_s.as_deref(),
+            day_s.as_deref(),
+            week_s.as_deref(),
+            day_of_week_s.as_deref(),
+            hour_s.as_deref(),
+            minute_s.as_deref(),
+            second_s.as_deref(),
+            sd, ed, tz, jitter,
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner: trigger })

@@ -59,6 +59,7 @@ Issues = "https://github.com/akshankrithick/apscheduler-rs/issues"
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "apscheduler._rust"
+manifest-path = "crates/pyext/Cargo.toml"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

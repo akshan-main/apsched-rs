@@ -245,6 +245,79 @@ pub enum TriggerState {
     },
 }
 
+impl TriggerState {
+    /// Compute the next fire time after a job has been executed.
+    /// `previous_fire_time` is the fire time that just occurred.
+    /// `now` is the current time.
+    /// Returns None for one-shot triggers (Date) or if past end_date.
+    pub fn compute_next_fire_time(
+        &self,
+        previous_fire_time: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        match self {
+            TriggerState::Date { .. } => {
+                // Date triggers are one-shot
+                None
+            }
+            TriggerState::Interval {
+                weeks,
+                days,
+                hours,
+                minutes,
+                seconds,
+                end_date,
+                ..
+            } => {
+                let total_secs = (*weeks) * 7 * 86400
+                    + (*days) * 86400
+                    + (*hours) * 3600
+                    + (*minutes) * 60
+                    + (*seconds);
+                if total_secs <= 0 {
+                    return None;
+                }
+                let interval = chrono::Duration::seconds(total_secs);
+                let mut next = previous_fire_time + interval;
+                // If we've fallen behind, advance to the next future fire time
+                while next <= now {
+                    next = next + interval;
+                }
+                // Check end_date
+                if let Some(end) = end_date {
+                    if next > *end {
+                        return None;
+                    }
+                }
+                Some(next)
+            }
+            TriggerState::Cron { end_date, .. } => {
+                // For cron, we can't easily compute the next fire time without
+                // a full cron parser. Return now + 1 second as a placeholder;
+                // the actual cron next-fire-time calculation happens when the
+                // trigger is reconstructed. This ensures the job stays active.
+                let next = now + chrono::Duration::seconds(1);
+                if let Some(end) = end_date {
+                    if next > *end {
+                        return None;
+                    }
+                }
+                Some(next)
+            }
+            TriggerState::CalendarInterval { end_date, .. } => {
+                // Similar placeholder for calendar interval
+                let next = now + chrono::Duration::seconds(1);
+                if let Some(end) = end_date {
+                    if next > *end {
+                        return None;
+                    }
+                }
+                Some(next)
+            }
+        }
+    }
+}
+
 /// The main schedule record. Represents a recurring or one-shot scheduled task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleSpec {

@@ -388,21 +388,32 @@ impl SchedulerEngine {
         .await
     }
 
-    /// Resume a paused job. The next_run_time should be recalculated by the trigger.
+    /// Resume a paused job. Recalculates next_run_time from the trigger state.
     pub async fn resume_job(
         &self,
         job_id: &str,
         jobstore: Option<&str>,
     ) -> Result<ScheduleSpec, SchedulerError> {
-        self.modify_job(
-            job_id,
-            jobstore,
-            JobChanges {
-                paused: Some(false),
-                ..Default::default()
-            },
-        )
-        .await
+        // First get the current spec to access trigger_state
+        let current = self.get_job(job_id, jobstore).await?;
+        let now = self.clock.now();
+        let next = current.trigger_state.compute_next_fire_time(now, now);
+
+        let spec = self
+            .modify_job(
+                job_id,
+                jobstore,
+                JobChanges {
+                    paused: Some(false),
+                    next_run_time: Some(next),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        // Wake the scheduler loop so it can pick up the resumed job
+        self.wakeup_notify.notify_one();
+        Ok(spec)
     }
 
     // -----------------------------------------------------------------------
@@ -871,16 +882,21 @@ impl SchedulerLoopContext {
             }
         }
 
-        // Update next_run_time in store (set to None; the caller/trigger should compute the next one)
-        // In a full implementation, we'd call the trigger here. For now, clear the next_run_time
-        // so the job doesn't fire again until a trigger recalculates it.
+        // Compute next fire time from the trigger state and update the store
         {
+            let next = schedule
+                .trigger_state
+                .compute_next_fire_time(fire_time, now);
             let store = {
                 let stores = self.stores.read();
                 stores.get(store_alias).cloned()
             };
             if let Some(store) = store {
-                let _ = store.update_next_run_time(job_id, None).await;
+                let _ = store.update_next_run_time(job_id, next).await;
+            }
+            // Wake the scheduler loop so it picks up the new next_run_time
+            if next.is_some() {
+                self.wakeup_notify.notify_one();
             }
         }
     }
