@@ -760,7 +760,11 @@ impl SchedulerLoopContext {
             None => return,
         };
 
-        // Apply misfire policy
+        // Determine whether the fire time is in the past (missed fires exist).
+        let coalesced = schedule.coalesce == crate::model::CoalescePolicy::On && fire_time < now;
+
+        // Apply misfire policy: if the fire time is too far in the past
+        // (beyond misfire_grace_time), skip it entirely.
         if let Some(grace) = schedule.misfire_grace_time {
             let deadline = fire_time
                 + chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
@@ -779,10 +783,10 @@ impl SchedulerLoopContext {
                     scheduled_run_time: fire_time,
                 });
 
-                // Advance to the next fire time (skip the missed execution)
+                // Advance to the next future fire time (skip all missed)
                 let next = schedule
                     .trigger_state
-                    .compute_next_fire_time(fire_time, now);
+                    .compute_next_future_fire_time(fire_time, now);
                 let store = {
                     let stores = self.stores.read();
                     stores.get(store_alias).cloned()
@@ -888,11 +892,19 @@ impl SchedulerLoopContext {
             }
         }
 
-        // Compute next fire time from the trigger state and update the store
+        // Compute next fire time from the trigger state and update the store.
+        // When coalescing, skip ahead to the next future fire time so that
+        // intermediate missed fire times are not re-processed one by one.
         {
-            let next = schedule
-                .trigger_state
-                .compute_next_fire_time(fire_time, now);
+            let next = if coalesced {
+                schedule
+                    .trigger_state
+                    .compute_next_future_fire_time(fire_time, now)
+            } else {
+                schedule
+                    .trigger_state
+                    .compute_next_fire_time(fire_time, now)
+            };
             let store = {
                 let stores = self.stores.read();
                 stores.get(store_alias).cloned()

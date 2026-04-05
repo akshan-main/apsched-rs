@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -267,6 +268,7 @@ impl TriggerState {
                 minutes,
                 seconds,
                 end_date,
+                jitter,
                 ..
             } => {
                 let total_secs = (*weeks) * 7 * 86400
@@ -278,17 +280,28 @@ impl TriggerState {
                     return None;
                 }
                 let interval = chrono::Duration::seconds(total_secs);
-                let mut next = previous_fire_time + interval;
-                // If we've fallen behind, advance to the next future fire time
-                while next <= now {
-                    next = next + interval;
-                }
+                // Advance by one interval step only.  The caller is
+                // responsible for skipping ahead further when
+                // coalescing is active.
+                let next = previous_fire_time + interval;
                 // Check end_date
                 if let Some(end) = end_date {
                     if next > *end {
                         return None;
                     }
                 }
+                // Apply jitter
+                let next = if let Some(j) = jitter {
+                    if *j > 0.0 {
+                        let offset_ms =
+                            rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
+                        next + chrono::Duration::milliseconds(offset_ms)
+                    } else {
+                        next
+                    }
+                } else {
+                    next
+                };
                 Some(next)
             }
             TriggerState::Cron { end_date, .. } => {
@@ -313,6 +326,69 @@ impl TriggerState {
                     }
                 }
                 Some(next)
+            }
+        }
+    }
+
+    /// Advance from `previous_fire_time` to the next fire time that is
+    /// strictly after `now`.  Used when coalescing missed executions so that
+    /// all past fire times are skipped in one shot.  Jitter is applied only
+    /// to the final result, not to intermediate steps.
+    pub fn compute_next_future_fire_time(
+        &self,
+        previous_fire_time: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        match self {
+            TriggerState::Interval {
+                weeks,
+                days,
+                hours,
+                minutes,
+                seconds,
+                end_date,
+                jitter,
+                ..
+            } => {
+                let total_secs = (*weeks) * 7 * 86400
+                    + (*days) * 86400
+                    + (*hours) * 3600
+                    + (*minutes) * 60
+                    + (*seconds);
+                if total_secs <= 0 {
+                    return None;
+                }
+                let interval = chrono::Duration::seconds(total_secs);
+                let mut next = previous_fire_time + interval;
+                while next <= now {
+                    next = next + interval;
+                }
+                if let Some(end) = end_date {
+                    if next > *end {
+                        return None;
+                    }
+                }
+                // Apply jitter to the final result only
+                if let Some(j) = jitter {
+                    if *j > 0.0 {
+                        let offset_ms =
+                            rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
+                        next = next + chrono::Duration::milliseconds(offset_ms);
+                    }
+                }
+                Some(next)
+            }
+            // For other trigger types, fall back to iterative advancement
+            _ => {
+                let mut prev = previous_fire_time;
+                loop {
+                    match self.compute_next_fire_time(prev, now) {
+                        Some(next) if next <= now => {
+                            prev = next;
+                        }
+                        other => return other,
+                    }
+                }
             }
         }
     }

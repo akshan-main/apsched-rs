@@ -68,6 +68,10 @@ struct PythonAwareExecutor {
     running_count: Arc<std::sync::atomic::AtomicU32>,
     started: Arc<std::sync::atomic::AtomicBool>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional reference to the Python asyncio event loop.
+    /// When set, coroutines returned by async callables are scheduled on this
+    /// loop via `asyncio.run_coroutine_threadsafe`.
+    event_loop: Option<PyObject>,
 }
 
 impl std::fmt::Debug for PythonAwareExecutor {
@@ -86,7 +90,13 @@ impl PythonAwareExecutor {
             running_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            event_loop: None,
         }
+    }
+
+    fn with_event_loop(mut self, loop_obj: PyObject) -> Self {
+        self.event_loop = Some(loop_obj);
+        self
     }
 }
 
@@ -133,18 +143,25 @@ impl Executor for PythonAwareExecutor {
 
         let running_count = Arc::clone(&self.running_count);
         let callable_store = Arc::clone(&self.callable_store);
+        // Wrap the event loop in Arc so we can move it into the spawned task
+        // without needing to clone the PyObject (which requires the GIL).
+        let event_loop: Option<Arc<PyObject>> = self.event_loop.as_ref().map(|l| {
+            Python::with_gil(|py| Arc::new(l.clone_ref(py)))
+        });
         let job_id = job.id;
         let schedule_id = job.schedule_id.clone();
         let task = job.task.clone();
 
         tokio::spawn(async move {
             let outcome = Python::with_gil(|py| {
+                let loop_ref = event_loop.as_ref().map(|arc| arc.as_ref());
                 match run_python_callable(
                     py,
                     &task.callable_ref,
                     &callable_store,
                     &task.args,
                     &task.kwargs,
+                    loop_ref,
                 ) {
                     Ok(_) => JobOutcome::Success,
                     Err(e) => JobOutcome::Error(format!("{}", e)),
@@ -627,6 +644,7 @@ fn run_python_callable(
     callable_store: &CallableStore,
     args: &[SerializedValue],
     kwargs: &HashMap<String, SerializedValue>,
+    event_loop: Option<&PyObject>,
 ) -> PyResult<PyObject> {
     // Resolve the callable
     let func: PyObject = match callable_ref {
@@ -660,7 +678,35 @@ fn run_python_callable(
     let kwargs_dict = kwargs_dict.downcast::<PyDict>()?;
 
     let result = func.bind(py).call(args_tuple, Some(kwargs_dict))?;
-    Ok(result.into())
+
+    // If the result is a coroutine (async function), we need to await it.
+    let inspect = py.import("inspect")?;
+    let is_coro: bool = inspect
+        .call_method1("iscoroutine", (&result,))?
+        .extract()?;
+
+    if is_coro {
+        let asyncio = py.import("asyncio")?;
+
+        if let Some(loop_obj) = event_loop {
+            // We have a captured event loop (AsyncIOScheduler case).
+            // Schedule the coroutine on that loop from this worker thread.
+            let future = asyncio.call_method1(
+                "run_coroutine_threadsafe",
+                (&result, loop_obj.bind(py)),
+            )?;
+            // Block this worker thread until the coroutine completes.
+            let awaited_result = future.call_method0("result")?;
+            Ok(awaited_result.into())
+        } else {
+            // No event loop provided (BlockingScheduler / BackgroundScheduler).
+            // Run the coroutine synchronously in a new event loop.
+            let new_result = asyncio.call_method1("run", (&result,))?;
+            Ok(new_result.into())
+        }
+    } else {
+        Ok(result.into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2273,12 +2319,19 @@ impl PyAsyncIOScheduler {
             .add_jobstore(default_store, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add default executor (Python-aware)
+        // Capture the running asyncio event loop so async callables can be
+        // scheduled on it from worker threads.
+        let asyncio = py.import("asyncio")?;
+        let event_loop: PyObject = asyncio
+            .call_method0("get_event_loop")?
+            .into();
+
+        // Add default executor (Python-aware, with event loop for coroutines)
         let callable_store = Arc::clone(&self.callable_store);
-        let default_executor = Arc::new(PythonAwareExecutor::new(
-            Arc::clone(&callable_store),
-            10,
-        ));
+        let default_executor = Arc::new(
+            PythonAwareExecutor::new(Arc::clone(&callable_store), 10)
+                .with_event_loop(event_loop),
+        );
         engine
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;
