@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*$py.class
+*.so
+*.pyd
+*.whl
+
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Maturin
+*.d
+
+# Benchmark results
+target/criterion/
+
+.env
+
+# Local planning docs
+/tmp/

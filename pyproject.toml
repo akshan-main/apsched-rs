@@ -1,0 +1,81 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "apscheduler-rs"
+version = "0.1.0"
+description = "A high-performance APScheduler-compatible scheduler runtime for Python, powered by Rust"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Akshan Krithick" }]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Software Distribution",
+]
+keywords = ["scheduler", "cron", "apscheduler", "rust", "async"]
+dependencies = [
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+sqlalchemy = ["sqlalchemy>=2.0"]
+mongodb = ["pymongo>=4.0"]
+redis = ["redis>=5.0"]
+all = ["apscheduler-rs[sqlalchemy,mongodb,redis]"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "apscheduler>=3.10,<4.0",
+    "hypothesis>=6.0",
+    "coverage>=7.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/akshankrithick/apscheduler-rs"
+Repository = "https://github.com/akshankrithick/apscheduler-rs"
+Documentation = "https://apscheduler-rs.readthedocs.io"
+Issues = "https://github.com/akshankrithick/apscheduler-rs/issues"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "apscheduler._rust"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "integration_tests"]
+markers = [
+    "slow: marks tests as slow",
+    "integration: marks integration tests",
+    "compatibility: marks APScheduler compatibility tests",
+]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "A", "COM", "C4", "DTZ", "ISC", "ICN", "PIE", "PT", "RSE", "RET", "SLF", "SIM", "TID", "TCH", "ARG", "PTH", "ERA"]

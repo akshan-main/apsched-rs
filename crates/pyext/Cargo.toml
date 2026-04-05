@@ -1,0 +1,26 @@
+[package]
+name = "apscheduler-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PyO3 extension module for apscheduler-rs"
+
+[lib]
+name = "_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+apsched-core = { path = "../core" }
+apsched-triggers = { path = "../triggers" }
+apsched-store = { path = "../store" }
+apsched-executors = { path = "../executors" }
+pyo3 = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
