@@ -314,6 +314,25 @@ impl SchedulerEngine {
         }
     }
 
+    /// Remove all jobs, optionally filtered to a specific store.
+    pub async fn remove_all_jobs(&self, jobstore: Option<&str>) -> Result<(), SchedulerError> {
+        if let Some(alias) = jobstore {
+            let store = self.get_store(alias)?;
+            store
+                .remove_all_jobs()
+                .await
+                .map_err(SchedulerError::StoreError)
+        } else {
+            let stores = self.stores.read();
+            for (_alias, store) in stores.iter() {
+                if let Err(e) = store.remove_all_jobs().await {
+                    tracing::warn!("error removing all jobs from store: {}", e);
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// Get all jobs, optionally filtered to a specific store.
     pub async fn get_jobs(
         &self,
@@ -543,6 +562,25 @@ impl SchedulerEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Introspection helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns the aliases of all registered job stores.
+    pub fn store_aliases(&self) -> Vec<String> {
+        self.stores.read().keys().cloned().collect()
+    }
+
+    /// Returns the aliases of all registered executors.
+    pub fn executor_aliases(&self) -> Vec<String> {
+        self.executors.read().keys().cloned().collect()
+    }
+
+    /// Returns the running instance count for a specific job, or 0 if not tracked.
+    pub fn running_instance_count(&self, job_id: &str) -> u32 {
+        self.running_instances.get(job_id).map(|v| *v).unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
@@ -747,7 +785,12 @@ impl SchedulerLoopContext {
         }
     }
 
-    async fn process_due_job(&self, store_alias: &str, schedule: &ScheduleSpec, now: DateTime<Utc>) {
+    async fn process_due_job(
+        &self,
+        store_alias: &str,
+        schedule: &ScheduleSpec,
+        now: DateTime<Utc>,
+    ) {
         let job_id = &schedule.id;
 
         // Skip paused jobs
@@ -766,8 +809,8 @@ impl SchedulerLoopContext {
         // Apply misfire policy: if the fire time is too far in the past
         // (beyond misfire_grace_time), skip it entirely.
         if let Some(grace) = schedule.misfire_grace_time {
-            let deadline = fire_time
-                + chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
+            let deadline =
+                fire_time + chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::zero());
             if now > deadline {
                 // Misfired
                 tracing::warn!(
@@ -802,11 +845,7 @@ impl SchedulerLoopContext {
         }
 
         // Check max_instances
-        let current_count = self
-            .running_instances
-            .get(job_id)
-            .map(|v| *v)
-            .unwrap_or(0);
+        let current_count = self.running_instances.get(job_id).map(|v| *v).unwrap_or(0);
 
         if current_count >= schedule.max_instances {
             tracing::debug!(
@@ -949,13 +988,11 @@ mod tests {
     use crate::clock::TestClock;
     use crate::error::StoreError;
     use crate::event::EVENT_ALL;
-    use crate::model::{
-        CallableRef, JobOutcome, ScheduleSpec, TaskSpec, TriggerState,
-    };
+    use crate::model::{CallableRef, JobOutcome, ScheduleSpec, TaskSpec, TriggerState};
     use async_trait::async_trait;
     use chrono::TimeZone;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use parking_lot::Mutex as PLMutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     // -----------------------------------------------------------------------
     // Mock JobStore
@@ -1405,7 +1442,10 @@ mod tests {
         let engine = SchedulerEngine::with_defaults();
         let spec = ScheduleSpec::new("job1", sample_task(), sample_trigger());
         let result = engine.add_job(spec).await;
-        assert!(matches!(result, Err(SchedulerError::JobStoreNotFound { .. })));
+        assert!(matches!(
+            result,
+            Err(SchedulerError::JobStoreNotFound { .. })
+        ));
     }
 
     #[test]

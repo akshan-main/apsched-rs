@@ -26,8 +26,7 @@ impl PyDateTrigger {
             Some(obj) => py_to_datetime(obj)?,
             None => Utc::now(),
         };
-        let trigger = DateTrigger::new(dt, tz)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let trigger = DateTrigger::new(dt, tz).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner: trigger })
     }
 
@@ -68,6 +67,10 @@ impl PyDateTrigger {
 #[pyclass(name = "IntervalTrigger")]
 pub struct PyIntervalTrigger {
     pub(crate) inner: IntervalTrigger,
+    /// Cached interval in seconds for fast-path computation
+    interval_secs: f64,
+    /// Cached Python timedelta for fast prev + interval computation
+    py_timedelta: PyObject,
 }
 
 #[pymethods]
@@ -75,6 +78,7 @@ impl PyIntervalTrigger {
     #[new]
     #[pyo3(signature = (weeks=0, days=0, hours=0, minutes=0, seconds=0, start_date=None, end_date=None, timezone=None, jitter=None))]
     fn new(
+        py: Python<'_>,
         weeks: i64,
         days: i64,
         hours: i64,
@@ -94,9 +98,22 @@ impl PyIntervalTrigger {
             Some(obj) => Some(py_to_datetime(obj)?),
             None => None,
         };
-        let trigger = IntervalTrigger::new(weeks, days, hours, minutes, seconds, sd, ed, tz, jitter)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { inner: trigger })
+        let interval_secs =
+            (weeks * 7 * 86400 + days * 86400 + hours * 3600 + minutes * 60 + seconds) as f64;
+        // Pre-create a Python timedelta for fast prev + interval in get_next_fire_time
+        let datetime_mod = py.import("datetime")?;
+        let timedelta_cls = datetime_mod.getattr("timedelta")?;
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("seconds", interval_secs)?;
+        let py_timedelta = timedelta_cls.call((), Some(&kwargs))?.unbind();
+        let trigger =
+            IntervalTrigger::new(weeks, days, hours, minutes, seconds, sd, ed, tz, jitter)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner: trigger,
+            interval_secs,
+            py_timedelta,
+        })
     }
 
     #[pyo3(signature = (previous_fire_time=None, now=None))]
@@ -106,15 +123,18 @@ impl PyIntervalTrigger {
         previous_fire_time: Option<&Bound<'_, PyAny>>,
         now: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Option<PyObject>> {
-        let prev = match previous_fire_time {
-            Some(obj) => Some(py_to_datetime(obj)?),
-            None => None,
-        };
+        // Fast path: when we have a previous_fire_time, just do prev + timedelta
+        // using Python's native datetime arithmetic (single __add__ call).
+        if let Some(prev_obj) = previous_fire_time {
+            let result = prev_obj.call_method1("__add__", (self.py_timedelta.bind(py),))?;
+            return Ok(Some(result.unbind()));
+        }
+        // Slow path: first fire needs full logic (start_date handling etc.)
         let now_dt = match now {
             Some(obj) => py_to_datetime(obj)?,
             None => Utc::now(),
         };
-        match self.inner.get_next_fire_time(prev, now_dt) {
+        match self.inner.get_next_fire_time(None, now_dt) {
             Some(dt) => Ok(Some(datetime_to_py(py, dt)?)),
             None => Ok(None),
         }
@@ -194,7 +214,10 @@ impl PyCronTrigger {
             hour_s.as_deref(),
             minute_s.as_deref(),
             second_s.as_deref(),
-            sd, ed, tz, jitter,
+            sd,
+            ed,
+            tz,
+            jitter,
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner: trigger })
@@ -264,9 +287,10 @@ impl PyCalendarIntervalTrigger {
             Some(obj) => Some(py_to_datetime(obj)?),
             None => None,
         };
-        let trigger =
-            CalendarIntervalTrigger::new(years, months, weeks, days, hour, minute, second, sd, ed, tz)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let trigger = CalendarIntervalTrigger::new(
+            years, months, weeks, days, hour, minute, second, sd, ed, tz,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner: trigger })
     }
 

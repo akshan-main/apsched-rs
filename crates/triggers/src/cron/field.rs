@@ -89,8 +89,8 @@ impl FieldMatcher {
         let base = self.min + ((start_word + 1) * 64) as u32;
         for w in (start_word + 1)..WORDS {
             if self.bits[w] != 0 {
-                let result = base + ((w - start_word - 1) * 64) as u32
-                    + self.bits[w].trailing_zeros();
+                let result =
+                    base + ((w - start_word - 1) * 64) as u32 + self.bits[w].trailing_zeros();
                 if result <= self.max {
                     return Some(result);
                 }

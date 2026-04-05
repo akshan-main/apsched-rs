@@ -22,10 +22,7 @@ impl DateTrigger {
         timezone
             .parse::<chrono_tz::Tz>()
             .map_err(|_| TriggerError::InvalidDate(format!("invalid timezone: {}", timezone)))?;
-        Ok(Self {
-            run_date,
-            timezone,
-        })
+        Ok(Self { run_date, timezone })
     }
 
     /// Returns the configured run date.
@@ -127,7 +124,10 @@ mod tests {
         let run_date = Utc::now();
         let trigger = DateTrigger::new(run_date, "US/Eastern".to_string()).unwrap();
         match trigger.serialize_state() {
-            TriggerState::Date { run_date: rd, timezone } => {
+            TriggerState::Date {
+                run_date: rd,
+                timezone,
+            } => {
                 assert_eq!(rd, run_date);
                 assert_eq!(timezone, "US/Eastern");
             }

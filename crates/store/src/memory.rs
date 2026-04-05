@@ -389,7 +389,10 @@ mod tests {
         store.add_job(spec).await.unwrap();
 
         store
-            .add_job(make_schedule("active_job", Some(now - Duration::seconds(5))))
+            .add_job(make_schedule(
+                "active_job",
+                Some(now - Duration::seconds(5)),
+            ))
             .await
             .unwrap();
 
@@ -590,7 +593,10 @@ mod tests {
         }
 
         // Acquire some leases
-        store.acquire_jobs("sched-1", 5, now + Duration::seconds(10)).await.unwrap();
+        store
+            .acquire_jobs("sched-1", 5, now + Duration::seconds(10))
+            .await
+            .unwrap();
 
         store.remove_all_jobs().await.unwrap();
 
@@ -613,10 +619,7 @@ mod tests {
 
         let retrieved = store.get_job("job1").await.unwrap();
         assert_eq!(retrieved.name, Some("updated name".to_string()));
-        assert_eq!(
-            retrieved.next_run_time,
-            Some(now + Duration::seconds(60))
-        );
+        assert_eq!(retrieved.next_run_time, Some(now + Duration::seconds(60)));
     }
 
     #[tokio::test]

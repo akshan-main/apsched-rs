@@ -256,10 +256,9 @@ mod tests {
 
     #[test]
     fn test_basic_monthly() {
-        let trigger = CalendarIntervalTrigger::new(
-            0, 1, 0, 0, 10, 0, 0, None, None, "UTC".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(0, 1, 0, 0, 10, 0, 0, None, None, "UTC".to_string())
+                .unwrap();
 
         let now = utc(2024, 1, 15, 8, 0, 0);
         let first = trigger.get_next_fire_time(None, now).unwrap();
@@ -274,7 +273,16 @@ mod tests {
         // Start on Jan 31, monthly interval.
         let start = utc(2024, 1, 31, 10, 0, 0);
         let trigger = CalendarIntervalTrigger::new(
-            0, 1, 0, 0, 10, 0, 0, Some(start), None, "UTC".to_string(),
+            0,
+            1,
+            0,
+            0,
+            10,
+            0,
+            0,
+            Some(start),
+            None,
+            "UTC".to_string(),
         )
         .unwrap();
 
@@ -296,7 +304,16 @@ mod tests {
         // Start on Feb 29, 2024. Yearly interval.
         let start = utc(2024, 2, 29, 12, 0, 0);
         let trigger = CalendarIntervalTrigger::new(
-            1, 0, 0, 0, 12, 0, 0, Some(start), None, "UTC".to_string(),
+            1,
+            0,
+            0,
+            0,
+            12,
+            0,
+            0,
+            Some(start),
+            None,
+            "UTC".to_string(),
         )
         .unwrap();
 
@@ -311,10 +328,9 @@ mod tests {
 
     #[test]
     fn test_weekly() {
-        let trigger = CalendarIntervalTrigger::new(
-            0, 0, 1, 0, 9, 0, 0, None, None, "UTC".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(0, 0, 1, 0, 9, 0, 0, None, None, "UTC".to_string())
+                .unwrap();
 
         let now = utc(2024, 3, 1, 8, 0, 0); // Friday
         let first = trigger.get_next_fire_time(None, now).unwrap();
@@ -327,10 +343,9 @@ mod tests {
     #[test]
     fn test_end_date() {
         let end = utc(2024, 3, 15, 23, 59, 59);
-        let trigger = CalendarIntervalTrigger::new(
-            0, 0, 1, 0, 9, 0, 0, None, Some(end), "UTC".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(0, 0, 1, 0, 9, 0, 0, None, Some(end), "UTC".to_string())
+                .unwrap();
 
         let now = utc(2024, 3, 1, 8, 0, 0);
         let first = trigger.get_next_fire_time(None, now).unwrap();
@@ -348,10 +363,9 @@ mod tests {
     #[test]
     fn test_past_time_today() {
         // If now is past the fire time for today, should advance to next interval.
-        let trigger = CalendarIntervalTrigger::new(
-            0, 0, 0, 1, 9, 0, 0, None, None, "UTC".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(0, 0, 0, 1, 9, 0, 0, None, None, "UTC".to_string())
+                .unwrap();
 
         let now = utc(2024, 3, 1, 10, 0, 0); // already past 9:00
         let first = trigger.get_next_fire_time(None, now).unwrap();
@@ -364,8 +378,16 @@ mod tests {
         // 2:30 AM doesn't exist.
         let start = utc(2024, 3, 3, 7, 30, 0); // Mar 3 at 2:30 AM ET
         let trigger = CalendarIntervalTrigger::new(
-            0, 0, 1, 0, 2, 30, 0,
-            Some(start), None, "America/New_York".to_string(),
+            0,
+            0,
+            1,
+            0,
+            2,
+            30,
+            0,
+            Some(start),
+            None,
+            "America/New_York".to_string(),
         )
         .unwrap();
 
@@ -386,8 +408,16 @@ mod tests {
         // 1:30 AM exists twice; should use first occurrence.
         let start = utc(2024, 10, 27, 5, 30, 0); // Oct 27 at 1:30 AM ET (EDT)
         let trigger = CalendarIntervalTrigger::new(
-            0, 0, 1, 0, 1, 30, 0,
-            Some(start), None, "America/New_York".to_string(),
+            0,
+            0,
+            1,
+            0,
+            1,
+            30,
+            0,
+            Some(start),
+            None,
+            "America/New_York".to_string(),
         )
         .unwrap();
 
@@ -403,26 +433,23 @@ mod tests {
 
     #[test]
     fn test_zero_interval_rejection() {
-        let result = CalendarIntervalTrigger::new(
-            0, 0, 0, 0, 9, 0, 0, None, None, "UTC".to_string(),
-        );
+        let result =
+            CalendarIntervalTrigger::new(0, 0, 0, 0, 9, 0, 0, None, None, "UTC".to_string());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_invalid_time() {
-        let result = CalendarIntervalTrigger::new(
-            0, 0, 0, 1, 25, 0, 0, None, None, "UTC".to_string(),
-        );
+        let result =
+            CalendarIntervalTrigger::new(0, 0, 0, 1, 25, 0, 0, None, None, "UTC".to_string());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_describe() {
-        let trigger = CalendarIntervalTrigger::new(
-            1, 2, 0, 0, 10, 30, 0, None, None, "UTC".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(1, 2, 0, 0, 10, 30, 0, None, None, "UTC".to_string())
+                .unwrap();
         assert_eq!(
             trigger.describe(),
             "calendarinterval[1 year(s), 2 month(s) at 10:30:00]"
@@ -431,13 +458,15 @@ mod tests {
 
     #[test]
     fn test_serialize_state() {
-        let trigger = CalendarIntervalTrigger::new(
-            0, 1, 0, 0, 9, 0, 0, None, None, "US/Eastern".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(0, 1, 0, 0, 9, 0, 0, None, None, "US/Eastern".to_string())
+                .unwrap();
         match trigger.serialize_state() {
             TriggerState::CalendarInterval {
-                months, hour, timezone, ..
+                months,
+                hour,
+                timezone,
+                ..
             } => {
                 assert_eq!(months, 1);
                 assert_eq!(hour, 9);
@@ -449,10 +478,9 @@ mod tests {
 
     #[test]
     fn test_trigger_type() {
-        let trigger = CalendarIntervalTrigger::new(
-            0, 0, 0, 1, 0, 0, 0, None, None, "UTC".to_string(),
-        )
-        .unwrap();
+        let trigger =
+            CalendarIntervalTrigger::new(0, 0, 0, 1, 0, 0, 0, None, None, "UTC".to_string())
+                .unwrap();
         assert_eq!(trigger.trigger_type(), "calendarinterval");
     }
 }

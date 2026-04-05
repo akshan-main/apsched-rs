@@ -223,11 +223,7 @@ impl EventBus {
         mask: u32,
     ) -> ListenerId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let listener = Listener {
-            id,
-            mask,
-            callback,
-        };
+        let listener = Listener { id, mask, callback };
         self.listeners.write().push(listener);
         id
     }

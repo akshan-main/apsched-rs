@@ -116,7 +116,10 @@ impl ThreadPoolExecutor {
 impl Executor for ThreadPoolExecutor {
     async fn start(&self) -> Result<(), ExecutorError> {
         self.started.store(true, Ordering::Relaxed);
-        debug!("ThreadPoolExecutor started with {} max workers", self.max_workers);
+        debug!(
+            "ThreadPoolExecutor started with {} max workers",
+            self.max_workers
+        );
         Ok(())
     }
 

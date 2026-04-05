@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
@@ -55,14 +55,23 @@ pub fn py_to_datetime(obj: &Bound<'_, PyAny>) -> PyResult<DateTime<Utc>> {
 }
 
 /// Convert a `chrono::DateTime<Utc>` to a Python `datetime.datetime` (UTC).
+/// Caches the datetime class and UTC timezone to avoid repeated module lookups.
 pub fn datetime_to_py(py: Python<'_>, dt: DateTime<Utc>) -> PyResult<PyObject> {
-    let datetime_mod = py.import("datetime")?;
-    let datetime_cls = datetime_mod.getattr("datetime")?;
-    let timezone_cls = datetime_mod.getattr("timezone")?;
-    let utc = timezone_cls.getattr("utc")?;
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<(PyObject, PyObject)> = OnceLock::new();
+
+    let (datetime_cls, utc) = CACHED.get_or_init(|| {
+        Python::with_gil(|py| {
+            let datetime_mod = py.import("datetime").unwrap();
+            let datetime_cls = datetime_mod.getattr("datetime").unwrap().unbind();
+            let timezone_cls = datetime_mod.getattr("timezone").unwrap();
+            let utc = timezone_cls.getattr("utc").unwrap().unbind();
+            (datetime_cls, utc)
+        })
+    });
 
     let naive = dt.naive_utc();
-    let result = datetime_cls.call1((
+    let result = datetime_cls.bind(py).call1((
         naive.date().year(),
         naive.date().month(),
         naive.date().day(),
@@ -70,14 +79,67 @@ pub fn datetime_to_py(py: Python<'_>, dt: DateTime<Utc>) -> PyResult<PyObject> {
         naive.time().minute(),
         naive.time().second(),
         naive.time().nanosecond() / 1000, // microseconds
-        &utc,
+        utc.bind(py),
     ))?;
 
     Ok(result.into())
 }
 
-use chrono::Datelike;
-use chrono::Timelike;
+/// Fast extraction: get a Python datetime as a UTC timestamp (f64 seconds since epoch).
+/// Much cheaper than full py_to_datetime when we only need a numeric value.
+pub fn py_to_timestamp(obj: &Bound<'_, PyAny>) -> PyResult<f64> {
+    // Try .timestamp() method first (available on all datetime objects)
+    if let Ok(ts) = obj.call_method0("timestamp") {
+        if let Ok(val) = ts.extract::<f64>() {
+            return Ok(val);
+        }
+    }
+    // Fallback: full conversion
+    let dt = py_to_datetime(obj)?;
+    Ok(dt.timestamp() as f64 + dt.timestamp_subsec_micros() as f64 / 1_000_000.0)
+}
+
+/// Fast construction: build a Python UTC datetime from a UTC timestamp.
+/// Converts the timestamp to components in Rust, then calls the datetime
+/// constructor directly (faster than `fromtimestamp`).
+/// Caches the datetime class and UTC timezone to avoid repeated module lookups.
+pub fn datetime_to_py_fast(py: Python<'_>, timestamp: f64) -> PyResult<PyObject> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<(PyObject, PyObject)> = OnceLock::new();
+
+    let (datetime_cls, utc) = CACHED.get_or_init(|| {
+        Python::with_gil(|py| {
+            let datetime_mod = py.import("datetime").unwrap();
+            let datetime_cls = datetime_mod.getattr("datetime").unwrap().unbind();
+            let timezone_cls = datetime_mod.getattr("timezone").unwrap();
+            let utc = timezone_cls.getattr("utc").unwrap().unbind();
+            (datetime_cls, utc)
+        })
+    });
+
+    // Convert timestamp to chrono DateTime for component extraction
+    let secs = timestamp.floor() as i64;
+    let micros = ((timestamp - timestamp.floor()) * 1_000_000.0).round() as u32;
+    let dt = Utc
+        .timestamp_opt(secs, micros * 1000)
+        .single()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid timestamp: {}", timestamp))
+        })?;
+
+    let naive = dt.naive_utc();
+    let result = datetime_cls.bind(py).call1((
+        naive.date().year(),
+        naive.date().month(),
+        naive.date().day(),
+        naive.time().hour(),
+        naive.time().minute(),
+        naive.time().second(),
+        micros,
+        utc.bind(py),
+    ))?;
+    Ok(result.into())
+}
 
 // ---------------------------------------------------------------------------
 // Python timedelta / number -> Duration
@@ -258,9 +320,10 @@ pub fn resolve_callable(
     let qualname = func.getattr("__qualname__");
 
     if let (Ok(module_obj), Ok(qualname_obj)) = (module, qualname) {
-        if let (Ok(module_str), Ok(qualname_str)) =
-            (module_obj.extract::<String>(), qualname_obj.extract::<String>())
-        {
+        if let (Ok(module_str), Ok(qualname_str)) = (
+            module_obj.extract::<String>(),
+            qualname_obj.extract::<String>(),
+        ) {
             // Check if it's a simple top-level function (no "<" in qualname,
             // no nested class methods like "Foo.<locals>.bar")
             if !qualname_str.contains('<')

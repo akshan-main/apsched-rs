@@ -134,7 +134,14 @@ impl CompiledCronExpr {
 
             let day_matched = loop {
                 let max_day = last_day_of_month(dt.year(), dt.month());
-                match self.find_matching_day(dt.day(), max_day, dt.year(), dt.month(), days_constrained, dow_constrained) {
+                match self.find_matching_day(
+                    dt.day(),
+                    max_day,
+                    dt.year(),
+                    dt.month(),
+                    days_constrained,
+                    dow_constrained,
+                ) {
                     Some(d) if d == dt.day() => break true,
                     Some(d) => {
                         dt = NaiveDateTime::new(
@@ -169,10 +176,7 @@ impl CompiledCronExpr {
             match self.hours.next_match(dt.hour()) {
                 Some(h) if h == dt.hour() => { /* ok */ }
                 Some(h) => {
-                    dt = NaiveDateTime::new(
-                        dt.date(),
-                        NaiveTime::from_hms_opt(h, 0, 0)?,
-                    );
+                    dt = NaiveDateTime::new(dt.date(), NaiveTime::from_hms_opt(h, 0, 0)?);
                     continue;
                 }
                 None => {
@@ -186,10 +190,7 @@ impl CompiledCronExpr {
             match self.minutes.next_match(dt.minute()) {
                 Some(m) if m == dt.minute() => { /* ok */ }
                 Some(m) => {
-                    dt = NaiveDateTime::new(
-                        dt.date(),
-                        NaiveTime::from_hms_opt(dt.hour(), m, 0)?,
-                    );
+                    dt = NaiveDateTime::new(dt.date(), NaiveTime::from_hms_opt(dt.hour(), m, 0)?);
                     continue;
                 }
                 None => {
@@ -408,8 +409,8 @@ mod tests {
 
     #[test]
     fn test_compile_defaults() {
-        let expr = CompiledCronExpr::compile(None, None, None, None, None, None, None, None)
-            .unwrap();
+        let expr =
+            CompiledCronExpr::compile(None, None, None, None, None, None, None, None).unwrap();
         // Everything should be "all".
         assert!(expr.seconds.is_all());
         assert!(expr.minutes.is_all());
@@ -422,17 +423,8 @@ mod tests {
 
     #[test]
     fn test_every_minute() {
-        let expr = CompiledCronExpr::compile(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("0"),
-        )
-        .unwrap();
+        let expr =
+            CompiledCronExpr::compile(None, None, None, None, None, None, None, Some("0")).unwrap();
         let after = utc(2024, 1, 1, 12, 0, 0);
         let next = expr.get_next_fire_time(after, "UTC").unwrap();
         assert_eq!(next, utc(2024, 1, 1, 12, 1, 0));
@@ -491,7 +483,7 @@ mod tests {
             None,
             None,
             None,
-            Some("0"),   // MON=0
+            Some("0"), // MON=0
             Some("9"),
             Some("0"),
             Some("0"),
@@ -619,17 +611,9 @@ mod tests {
     #[test]
     fn test_no_match_returns_none() {
         // Year 2020 only, but we're past 2020.
-        let expr = CompiledCronExpr::compile(
-            Some("2020"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let expr =
+            CompiledCronExpr::compile(Some("2020"), None, None, None, None, None, None, None)
+                .unwrap();
         let after = utc(2024, 1, 1, 0, 0, 0);
         assert!(expr.get_next_fire_time(after, "UTC").is_none());
     }

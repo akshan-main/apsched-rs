@@ -244,6 +244,10 @@ pub enum TriggerState {
         end_date: Option<DateTime<Utc>>,
         timezone: String,
     },
+    /// A custom plugin trigger whose scheduling logic lives in user code (e.g. Python).
+    /// The description is a human-readable label; the actual fire-time computation
+    /// is handled by the wrapper that holds the trigger object reference.
+    Plugin { description: String },
 }
 
 impl TriggerState {
@@ -293,8 +297,7 @@ impl TriggerState {
                 // Apply jitter
                 let next = if let Some(j) = jitter {
                     if *j > 0.0 {
-                        let offset_ms =
-                            rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
+                        let offset_ms = rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
                         next + chrono::Duration::milliseconds(offset_ms)
                     } else {
                         next
@@ -326,6 +329,13 @@ impl TriggerState {
                     }
                 }
                 Some(next)
+            }
+            TriggerState::Plugin { .. } => {
+                // Plugin triggers compute their next fire time via the
+                // wrapper that holds the user callback.  When we only have
+                // the serialized state we use a 1-second placeholder so the
+                // job stays active in the scheduler loop.
+                Some(now + chrono::Duration::seconds(1))
             }
         }
     }
@@ -371,8 +381,7 @@ impl TriggerState {
                 // Apply jitter to the final result only
                 if let Some(j) = jitter {
                     if *j > 0.0 {
-                        let offset_ms =
-                            rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
+                        let offset_ms = rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
                         next = next + chrono::Duration::milliseconds(offset_ms);
                     }
                 }

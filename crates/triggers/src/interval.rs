@@ -58,9 +58,9 @@ impl IntervalTrigger {
         jitter: Option<f64>,
     ) -> Result<Self, TriggerError> {
         // Validate timezone
-        timezone
-            .parse::<chrono_tz::Tz>()
-            .map_err(|_| TriggerError::InvalidInterval(format!("invalid timezone: {}", timezone)))?;
+        timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+            TriggerError::InvalidInterval(format!("invalid timezone: {}", timezone))
+        })?;
 
         let total_secs = weeks * 7 * 86400 + days * 86400 + hours * 3600 + minutes * 60 + seconds;
         if total_secs <= 0 {
@@ -226,8 +226,7 @@ mod tests {
         let now = Utc::now();
         let end = now + Duration::seconds(90);
         let trigger =
-            IntervalTrigger::new(0, 0, 0, 0, 60, None, Some(end), "UTC".to_string(), None)
-                .unwrap();
+            IntervalTrigger::new(0, 0, 0, 0, 60, None, Some(end), "UTC".to_string(), None).unwrap();
 
         let first = trigger.get_next_fire_time(None, now).unwrap();
         let second = trigger.get_next_fire_time(Some(first), now);
@@ -240,8 +239,7 @@ mod tests {
     #[test]
     fn test_jitter_bounds() {
         let trigger =
-            IntervalTrigger::new(0, 0, 0, 0, 60, None, None, "UTC".to_string(), Some(5.0))
-                .unwrap();
+            IntervalTrigger::new(0, 0, 0, 0, 60, None, None, "UTC".to_string(), Some(5.0)).unwrap();
         let now = Utc::now();
 
         for _ in 0..50 {
@@ -265,8 +263,8 @@ mod tests {
 
     #[test]
     fn test_describe() {
-        let trigger = IntervalTrigger::new(0, 0, 2, 0, 0, None, None, "UTC".to_string(), None)
-            .unwrap();
+        let trigger =
+            IntervalTrigger::new(0, 0, 2, 0, 0, None, None, "UTC".to_string(), None).unwrap();
         assert_eq!(trigger.describe(), "interval[2 hours]");
 
         let trigger = make_trigger(90);
@@ -276,8 +274,7 @@ mod tests {
     #[test]
     fn test_serialize_state() {
         let trigger =
-            IntervalTrigger::new(1, 2, 3, 4, 5, None, None, "UTC".to_string(), Some(1.0))
-                .unwrap();
+            IntervalTrigger::new(1, 2, 3, 4, 5, None, None, "UTC".to_string(), Some(1.0)).unwrap();
         match trigger.serialize_state() {
             TriggerState::Interval {
                 weeks,

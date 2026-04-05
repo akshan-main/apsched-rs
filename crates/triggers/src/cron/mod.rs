@@ -62,7 +62,8 @@ impl CronTrigger {
             TriggerError::InvalidCronExpression(format!("invalid timezone: {}", timezone))
         })?;
 
-        let compiled = CompiledCronExpr::compile(year, month, day, week, day_of_week, hour, minute, second)?;
+        let compiled =
+            CompiledCronExpr::compile(year, month, day, week, day_of_week, hour, minute, second)?;
 
         Ok(Self {
             expr: compiled,
@@ -94,9 +95,7 @@ impl Trigger for CronTrigger {
             None => {
                 // If start_date is set and in the future, search from just before it.
                 match self.start_date {
-                    Some(start) if start > now => {
-                        start - chrono::Duration::seconds(1)
-                    }
+                    Some(start) if start > now => start - chrono::Duration::seconds(1),
                     _ => now,
                 }
             }
@@ -108,10 +107,9 @@ impl Trigger for CronTrigger {
         if let Some(start) = self.start_date {
             if candidate < start {
                 // Search again from start.
-                let candidate2 = self.expr.get_next_fire_time(
-                    start - chrono::Duration::seconds(1),
-                    &self.timezone,
-                )?;
+                let candidate2 = self
+                    .expr
+                    .get_next_fire_time(start - chrono::Duration::seconds(1), &self.timezone)?;
                 if let Some(end) = self.end_date {
                     if candidate2 > end {
                         return None;
@@ -189,8 +187,18 @@ mod tests {
     fn test_basic_cron() {
         // Every minute at :00 seconds.
         let trigger = CronTrigger::new(
-            None, None, None, None, None, None, None, Some("0"),
-            None, None, "UTC".to_string(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0"),
+            None,
+            None,
+            "UTC".to_string(),
+            None,
         )
         .unwrap();
 
@@ -203,8 +211,18 @@ mod tests {
     fn test_cron_with_start_date() {
         let start = utc(2024, 7, 1, 0, 0, 0);
         let trigger = CronTrigger::new(
-            None, None, None, None, None, Some("12"), Some("0"), Some("0"),
-            Some(start), None, "UTC".to_string(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+            Some(start),
+            None,
+            "UTC".to_string(),
+            None,
         )
         .unwrap();
 
@@ -218,8 +236,18 @@ mod tests {
     fn test_cron_with_end_date() {
         let end = utc(2024, 6, 15, 12, 0, 0);
         let trigger = CronTrigger::new(
-            None, None, None, None, None, Some("12"), Some("0"), Some("0"),
-            None, Some(end), "UTC".to_string(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+            None,
+            Some(end),
+            "UTC".to_string(),
+            None,
         )
         .unwrap();
 
@@ -235,8 +263,18 @@ mod tests {
     #[test]
     fn test_cron_describe() {
         let trigger = CronTrigger::new(
-            None, None, None, None, Some("MON-FRI"), Some("9"), Some("0"), Some("0"),
-            None, None, "UTC".to_string(), None,
+            None,
+            None,
+            None,
+            None,
+            Some("MON-FRI"),
+            Some("9"),
+            Some("0"),
+            Some("0"),
+            None,
+            None,
+            "UTC".to_string(),
+            None,
         )
         .unwrap();
         assert_eq!(trigger.describe(), "cron[0 9 * * MON-FRI]");
@@ -245,8 +283,18 @@ mod tests {
     #[test]
     fn test_cron_serialize_state() {
         let trigger = CronTrigger::new(
-            Some("2024"), Some("1-6"), None, None, None, Some("*/2"), Some("0"), Some("0"),
-            None, None, "UTC".to_string(), Some(2.0),
+            Some("2024"),
+            Some("1-6"),
+            None,
+            None,
+            None,
+            Some("*/2"),
+            Some("0"),
+            Some("0"),
+            None,
+            None,
+            "UTC".to_string(),
+            Some(2.0),
         )
         .unwrap();
         match trigger.serialize_state() {
@@ -269,8 +317,18 @@ mod tests {
     #[test]
     fn test_cron_trigger_type() {
         let trigger = CronTrigger::new(
-            None, None, None, None, None, None, None, None,
-            None, None, "UTC".to_string(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "UTC".to_string(),
+            None,
         )
         .unwrap();
         assert_eq!(trigger.trigger_type(), "cron");
@@ -279,8 +337,18 @@ mod tests {
     #[test]
     fn test_cron_jitter() {
         let trigger = CronTrigger::new(
-            None, None, None, None, None, None, None, Some("0"),
-            None, None, "UTC".to_string(), Some(5.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0"),
+            None,
+            None,
+            "UTC".to_string(),
+            Some(5.0),
         )
         .unwrap();
 
@@ -297,8 +365,18 @@ mod tests {
     #[test]
     fn test_cron_invalid_timezone() {
         let result = CronTrigger::new(
-            None, None, None, None, None, None, None, None,
-            None, None, "Invalid/TZ".to_string(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "Invalid/TZ".to_string(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -306,8 +384,18 @@ mod tests {
     #[test]
     fn test_cron_invalid_field() {
         let result = CronTrigger::new(
-            None, Some("13"), None, None, None, None, None, None,
-            None, None, "UTC".to_string(), None,
+            None,
+            Some("13"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "UTC".to_string(),
+            None,
         );
         assert!(result.is_err());
     }

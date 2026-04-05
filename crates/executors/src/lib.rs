@@ -31,14 +31,12 @@ mod tests {
     use uuid::Uuid;
 
     use apsched_core::error::ExecutorError;
-    use apsched_core::model::{
-        CallableRef, JobOutcome, JobSpec, TaskSpec,
-    };
+    use apsched_core::model::{CallableRef, JobOutcome, JobSpec, TaskSpec};
     use apsched_core::traits::Executor;
 
     use crate::base::CallableHandle;
-    use crate::threadpool::ThreadPoolExecutor;
     use crate::processpool::ProcessPoolExecutor;
+    use crate::threadpool::ThreadPoolExecutor;
 
     /// Helper: create a minimal JobSpec for testing.
     fn test_job() -> JobSpec {
@@ -56,9 +54,7 @@ mod tests {
 
     /// Helper: create a RustFn callable that returns Success after a short delay.
     fn success_callable() -> CallableHandle {
-        CallableHandle::RustFn(Arc::new(|_job| {
-            async { JobOutcome::Success }.boxed()
-        }))
+        CallableHandle::RustFn(Arc::new(|_job| async { JobOutcome::Success }.boxed()))
     }
 
     /// Helper: callable that sleeps for the given duration then returns Success.
@@ -117,9 +113,13 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
 
         // First job should succeed.
-        exec.submit_job_with_callable(test_job(), slow_callable(Duration::from_secs(5)), tx.clone())
-            .await
-            .unwrap();
+        exec.submit_job_with_callable(
+            test_job(),
+            slow_callable(Duration::from_secs(5)),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
 
         // Second job should fail — pool exhausted.
         let err = exec
@@ -161,19 +161,17 @@ mod tests {
         exec.start().await.unwrap();
 
         let (tx, mut rx) = mpsc::channel(16);
-        exec.submit_job_with_callable(
-            test_job(),
-            slow_callable(Duration::from_millis(100)),
-            tx,
-        )
-        .await
-        .unwrap();
+        exec.submit_job_with_callable(test_job(), slow_callable(Duration::from_millis(100)), tx)
+            .await
+            .unwrap();
 
         // shutdown(wait=true) should wait for the job to finish.
         exec.shutdown(true).await.unwrap();
 
         // Result should be available.
-        let result = rx.try_recv().expect("should have result after shutdown(wait=true)");
+        let result = rx
+            .try_recv()
+            .expect("should have result after shutdown(wait=true)");
         assert!(matches!(result.outcome, JobOutcome::Success));
     }
 
@@ -183,13 +181,9 @@ mod tests {
         exec.start().await.unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
-        exec.submit_job_with_callable(
-            test_job(),
-            slow_callable(Duration::from_secs(10)),
-            tx,
-        )
-        .await
-        .unwrap();
+        exec.submit_job_with_callable(test_job(), slow_callable(Duration::from_secs(10)), tx)
+            .await
+            .unwrap();
 
         // shutdown(wait=false) should return quickly.
         let start = std::time::Instant::now();
@@ -315,9 +309,13 @@ mod tests {
         exec.start().await.unwrap();
 
         let (tx, _rx) = mpsc::channel(16);
-        exec.submit_job_with_callable(test_job(), slow_callable(Duration::from_secs(5)), tx.clone())
-            .await
-            .unwrap();
+        exec.submit_job_with_callable(
+            test_job(),
+            slow_callable(Duration::from_secs(5)),
+            tx.clone(),
+        )
+        .await
+        .unwrap();
 
         let err = exec
             .submit_job_with_callable(test_job(), success_callable(), tx)

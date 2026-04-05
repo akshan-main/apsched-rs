@@ -88,14 +88,12 @@ impl SqlJobStore {
 
     /// Serialize a ScheduleSpec to JSON string for storage.
     fn serialize_spec(spec: &ScheduleSpec) -> Result<String, StoreError> {
-        serde_json::to_string(spec)
-            .map_err(|e| StoreError::SerializationFailed(e.to_string()))
+        serde_json::to_string(spec).map_err(|e| StoreError::SerializationFailed(e.to_string()))
     }
 
     /// Deserialize a ScheduleSpec from a JSON string.
     fn deserialize_spec(json: &str) -> Result<ScheduleSpec, StoreError> {
-        serde_json::from_str(json)
-            .map_err(|e| StoreError::DeserializationFailed(e.to_string()))
+        serde_json::from_str(json).map_err(|e| StoreError::DeserializationFailed(e.to_string()))
     }
 
     /// Extract the trigger type string from a ScheduleSpec.
@@ -105,6 +103,7 @@ impl SqlJobStore {
             apsched_core::model::TriggerState::Interval { .. } => "interval",
             apsched_core::model::TriggerState::Cron { .. } => "cron",
             apsched_core::model::TriggerState::CalendarInterval { .. } => "calendar_interval",
+            apsched_core::model::TriggerState::Plugin { .. } => "plugin",
         }
     }
 
@@ -117,7 +116,9 @@ impl SqlJobStore {
     fn string_to_dt(s: &str) -> Result<DateTime<Utc>, StoreError> {
         DateTime::parse_from_rfc3339(s)
             .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| StoreError::DeserializationFailed(format!("invalid datetime '{}': {}", s, e)))
+            .map_err(|e| {
+                StoreError::DeserializationFailed(format!("invalid datetime '{}': {}", s, e))
+            })
     }
 
     /// Parse a ScheduleSpec from a database row.
@@ -492,10 +493,7 @@ impl JobStore for SqlJobStore {
     }
 
     async fn get_running_count(&self, job_id: &str) -> Result<u32, StoreError> {
-        let query = format!(
-            "SELECT running_count FROM {} WHERE id = ?",
-            self.table_name
-        );
+        let query = format!("SELECT running_count FROM {} WHERE id = ?", self.table_name);
 
         let row: Option<SqliteRow> = sqlx::query(&query)
             .bind(job_id)
@@ -595,8 +593,14 @@ mod tests {
     #[tokio::test]
     async fn test_remove_all_jobs() {
         let store = create_test_store().await;
-        store.add_job(make_schedule("a", Some(Utc::now()))).await.unwrap();
-        store.add_job(make_schedule("b", Some(Utc::now()))).await.unwrap();
+        store
+            .add_job(make_schedule("a", Some(Utc::now())))
+            .await
+            .unwrap();
+        store
+            .add_job(make_schedule("b", Some(Utc::now())))
+            .await
+            .unwrap();
 
         store.remove_all_jobs().await.unwrap();
 
@@ -614,9 +618,15 @@ mod tests {
         let future = now + chrono::Duration::hours(1);
 
         // Past job - should be due
-        store.add_job(make_schedule("past", Some(past))).await.unwrap();
+        store
+            .add_job(make_schedule("past", Some(past)))
+            .await
+            .unwrap();
         // Future job - should NOT be due
-        store.add_job(make_schedule("future", Some(future))).await.unwrap();
+        store
+            .add_job(make_schedule("future", Some(future)))
+            .await
+            .unwrap();
         // Paused job with past time - should NOT be due
         let mut paused = make_schedule("paused", Some(past));
         paused.paused = true;
@@ -644,7 +654,10 @@ mod tests {
         let store = create_test_store().await;
         let now = Utc::now();
         let past = now - chrono::Duration::minutes(5);
-        store.add_job(make_schedule("contested", Some(past))).await.unwrap();
+        store
+            .add_job(make_schedule("contested", Some(past)))
+            .await
+            .unwrap();
 
         // First scheduler acquires the job
         let leases1 = store.acquire_jobs("scheduler-A", 10, now).await.unwrap();
@@ -665,7 +678,10 @@ mod tests {
         let store = create_test_store().await;
         let now = Utc::now();
         let past = now - chrono::Duration::minutes(5);
-        store.add_job(make_schedule("expiring", Some(past))).await.unwrap();
+        store
+            .add_job(make_schedule("expiring", Some(past)))
+            .await
+            .unwrap();
 
         // First scheduler acquires the job
         let leases = store.acquire_jobs("scheduler-A", 10, now).await.unwrap();
@@ -676,7 +692,10 @@ mod tests {
 
         // Second scheduler should now be able to acquire the job
         // because the lease has expired (lease_expires_at < after_expiry)
-        let leases2 = store.acquire_jobs("scheduler-B", 10, after_expiry).await.unwrap();
+        let leases2 = store
+            .acquire_jobs("scheduler-B", 10, after_expiry)
+            .await
+            .unwrap();
         assert_eq!(leases2.len(), 1);
         assert_eq!(leases2[0].scheduler_id, "scheduler-B");
     }
@@ -688,18 +707,30 @@ mod tests {
         let store = create_test_store().await;
         let now = Utc::now();
         let new_time = now + chrono::Duration::hours(2);
-        store.add_job(make_schedule("update_nrt", Some(now))).await.unwrap();
+        store
+            .add_job(make_schedule("update_nrt", Some(now)))
+            .await
+            .unwrap();
 
-        store.update_next_run_time("update_nrt", Some(new_time)).await.unwrap();
+        store
+            .update_next_run_time("update_nrt", Some(new_time))
+            .await
+            .unwrap();
 
         let spec = store.get_job("update_nrt").await.unwrap();
-        assert_eq!(spec.next_run_time.unwrap().timestamp(), new_time.timestamp());
+        assert_eq!(
+            spec.next_run_time.unwrap().timestamp(),
+            new_time.timestamp()
+        );
     }
 
     #[tokio::test]
     async fn test_update_next_run_time_to_none() {
         let store = create_test_store().await;
-        store.add_job(make_schedule("clear_nrt", Some(Utc::now()))).await.unwrap();
+        store
+            .add_job(make_schedule("clear_nrt", Some(Utc::now())))
+            .await
+            .unwrap();
 
         store.update_next_run_time("clear_nrt", None).await.unwrap();
 
@@ -719,7 +750,10 @@ mod tests {
     #[tokio::test]
     async fn test_running_count() {
         let store = create_test_store().await;
-        store.add_job(make_schedule("rc_job", Some(Utc::now()))).await.unwrap();
+        store
+            .add_job(make_schedule("rc_job", Some(Utc::now())))
+            .await
+            .unwrap();
 
         // Initial count is 0
         let count = store.get_running_count("rc_job").await.unwrap();
@@ -761,7 +795,10 @@ mod tests {
         let store = create_test_store().await;
         let now = Utc::now();
         store.add_job(make_schedule("j1", Some(now))).await.unwrap();
-        store.add_job(make_schedule("j2", Some(now + chrono::Duration::hours(1)))).await.unwrap();
+        store
+            .add_job(make_schedule("j2", Some(now + chrono::Duration::hours(1))))
+            .await
+            .unwrap();
         store.add_job(make_schedule("j3", None)).await.unwrap();
 
         let all = store.get_all_jobs().await.unwrap();
@@ -779,8 +816,14 @@ mod tests {
         let nrt = store.get_next_run_time().await.unwrap();
         assert!(nrt.is_none());
 
-        store.add_job(make_schedule("late_job", Some(late))).await.unwrap();
-        store.add_job(make_schedule("early_job", Some(early))).await.unwrap();
+        store
+            .add_job(make_schedule("late_job", Some(late)))
+            .await
+            .unwrap();
+        store
+            .add_job(make_schedule("early_job", Some(early)))
+            .await
+            .unwrap();
 
         let nrt = store.get_next_run_time().await.unwrap();
         assert!(nrt.is_some());
@@ -813,7 +856,10 @@ mod tests {
         let store = create_test_store().await;
         let now = Utc::now();
         let past = now - chrono::Duration::minutes(1);
-        store.add_job(make_schedule("rel_job", Some(past))).await.unwrap();
+        store
+            .add_job(make_schedule("rel_job", Some(past)))
+            .await
+            .unwrap();
 
         // Acquire
         let leases = store.acquire_jobs("sched-1", 10, now).await.unwrap();
@@ -838,7 +884,10 @@ mod tests {
         store.add_job(paused_spec).await.unwrap();
 
         let late = now + chrono::Duration::hours(3);
-        store.add_job(make_schedule("active_late", Some(late))).await.unwrap();
+        store
+            .add_job(make_schedule("active_late", Some(late)))
+            .await
+            .unwrap();
 
         let nrt = store.get_next_run_time().await.unwrap();
         assert!(nrt.is_some());
@@ -868,7 +917,13 @@ mod tests {
 
         let retrieved = store.get_job("interval_job").await.unwrap();
         match &retrieved.trigger_state {
-            TriggerState::Interval { days, hours, minutes, jitter, .. } => {
+            TriggerState::Interval {
+                days,
+                hours,
+                minutes,
+                jitter,
+                ..
+            } => {
                 assert_eq!(*days, 1);
                 assert_eq!(*hours, 2);
                 assert_eq!(*minutes, 30);

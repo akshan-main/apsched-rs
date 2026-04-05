@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 mod convert;
 mod events;
 mod executors;
+mod plugin_trigger;
 mod scheduler;
 mod stores;
 mod triggers;

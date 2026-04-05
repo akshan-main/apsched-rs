@@ -124,9 +124,7 @@ impl Clock for TestClock {
             let real_elapsed = self.base_monotonic.elapsed();
             if real_elapsed > offset {
                 let additional = real_elapsed - offset;
-                current
-                    + chrono::Duration::from_std(additional)
-                        .unwrap_or(chrono::Duration::zero())
+                current + chrono::Duration::from_std(additional).unwrap_or(chrono::Duration::zero())
             } else {
                 current
             }
