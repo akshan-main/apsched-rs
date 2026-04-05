@@ -1,0 +1,2224 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use chrono::Utc;
+use parking_lot::RwLock;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyTuple};
+
+use apsched_core::event::{SchedulerEvent, EVENT_ALL};
+use apsched_core::model::{
+    CallableRef, CoalescePolicy, ScheduleSpec, SchedulerConfig, SerializedValue, TaskSpec,
+    TriggerState,
+};
+use apsched_core::traits::{JobStore, Trigger};
+use apsched_core::SchedulerEngine;
+use apsched_store::MemoryJobStore;
+
+use crate::convert::{
+    datetime_to_py, deserialize_py_args, py_to_datetime, resolve_callable,
+    scheduler_error_to_pyerr, serialize_py_args,
+};
+use crate::triggers::{PyCalendarIntervalTrigger, PyCronTrigger, PyDateTrigger, PyIntervalTrigger};
+
+// ---------------------------------------------------------------------------
+// Callable store: holds Python callable objects that can't be serialized
+// ---------------------------------------------------------------------------
+
+struct CallableStore {
+    callables: RwLock<HashMap<u64, PyObject>>,
+    next_id: AtomicU64,
+}
+
+impl CallableStore {
+    fn new() -> Self {
+        Self {
+            callables: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn store(&self, obj: PyObject) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.callables.write().insert(id, obj);
+        id
+    }
+
+    fn get(&self, id: u64) -> Option<PyObject> {
+        self.callables.read().get(&id).map(|obj| obj.clone())
+    }
+
+    #[allow(dead_code)]
+    fn remove(&self, id: u64) -> Option<PyObject> {
+        self.callables.write().remove(&id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pending job (queued before scheduler starts)
+// ---------------------------------------------------------------------------
+
+struct PendingJob {
+    spec: ScheduleSpec,
+}
+
+// ---------------------------------------------------------------------------
+// PyJob wrapper
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "Job")]
+pub struct PyJob {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    name: Option<String>,
+    #[pyo3(get)]
+    next_run_time: Option<PyObject>,
+    #[pyo3(get)]
+    trigger: Option<String>,
+    #[pyo3(get)]
+    executor: String,
+    #[pyo3(get)]
+    jobstore: String,
+}
+
+#[pymethods]
+impl PyJob {
+    fn __repr__(&self) -> String {
+        let name = self.name.as_deref().unwrap_or(&self.id);
+        match &self.next_run_time {
+            Some(_) => format!("<Job (id={} name='{}')>", self.id, name),
+            None => format!("<Job (id={} name='{}' paused)>", self.id, name),
+        }
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+
+    #[getter]
+    fn pending(&self) -> bool {
+        self.next_run_time.is_some()
+    }
+}
+
+impl PyJob {
+    fn from_spec(py: Python<'_>, spec: &ScheduleSpec) -> PyResult<Self> {
+        let nrt = match spec.next_run_time {
+            Some(dt) => Some(datetime_to_py(py, dt)?),
+            None => None,
+        };
+        let trigger_desc = match &spec.trigger_state {
+            TriggerState::Date { .. } => Some("date".to_string()),
+            TriggerState::Interval { .. } => Some("interval".to_string()),
+            TriggerState::Cron { .. } => Some("cron".to_string()),
+            TriggerState::CalendarInterval { .. } => Some("calendarinterval".to_string()),
+        };
+        Ok(Self {
+            id: spec.id.clone(),
+            name: spec.name.clone(),
+            next_run_time: nrt,
+            trigger: trigger_desc,
+            executor: spec.executor.clone(),
+            jobstore: spec.jobstore.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse a trigger from Python arguments
+// ---------------------------------------------------------------------------
+
+fn parse_trigger(
+    py: Python<'_>,
+    trigger: &Bound<'_, PyAny>,
+    trigger_args: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Box<dyn Trigger>> {
+    // If it's a string, create the appropriate trigger from trigger_args
+    if let Ok(trigger_str) = trigger.extract::<String>() {
+        let args = trigger_args;
+        return match trigger_str.as_str() {
+            "date" => {
+                let run_date = args.and_then(|a| a.get_item("run_date").ok().flatten());
+                let timezone = args
+                    .and_then(|a| {
+                        a.get_item("timezone")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<String>().ok())
+                    });
+                let tz = timezone.as_deref().unwrap_or("UTC");
+                let dt = match run_date {
+                    Some(ref obj) => py_to_datetime(obj)?,
+                    None => Utc::now(),
+                };
+                let t = apsched_triggers::DateTrigger::new(dt, tz.to_string())
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(Box::new(t))
+            }
+            "interval" => {
+                let get_i64 = |key: &str, default: i64| -> i64 {
+                    args.and_then(|a| {
+                        a.get_item(key)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<i64>().ok())
+                    })
+                    .unwrap_or(default)
+                };
+                let weeks = get_i64("weeks", 0);
+                let days = get_i64("days", 0);
+                let hours = get_i64("hours", 0);
+                let minutes = get_i64("minutes", 0);
+                let seconds = get_i64("seconds", 0);
+                let start_date = args
+                    .and_then(|a| a.get_item("start_date").ok().flatten())
+                    .map(|obj| py_to_datetime(&obj))
+                    .transpose()?;
+                let end_date = args
+                    .and_then(|a| a.get_item("end_date").ok().flatten())
+                    .map(|obj| py_to_datetime(&obj))
+                    .transpose()?;
+                let timezone = args
+                    .and_then(|a| {
+                        a.get_item("timezone")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<String>().ok())
+                    })
+                    .unwrap_or_else(|| "UTC".to_string());
+                let jitter = args.and_then(|a| {
+                    a.get_item("jitter")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.extract::<f64>().ok())
+                });
+
+                let t = apsched_triggers::IntervalTrigger::new(
+                    weeks, days, hours, minutes, seconds, start_date, end_date, timezone, jitter,
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(Box::new(t))
+            }
+            "cron" => {
+                let get_str = |key: &str| -> Option<String> {
+                    args.and_then(|a| {
+                        a.get_item(key)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<String>().ok())
+                    })
+                };
+                let year = get_str("year");
+                let month = get_str("month");
+                let day = get_str("day");
+                let week = get_str("week");
+                let day_of_week = get_str("day_of_week");
+                let hour = get_str("hour");
+                let minute = get_str("minute");
+                let second = get_str("second");
+                let start_date = args
+                    .and_then(|a| a.get_item("start_date").ok().flatten())
+                    .map(|obj| py_to_datetime(&obj))
+                    .transpose()?;
+                let end_date = args
+                    .and_then(|a| a.get_item("end_date").ok().flatten())
+                    .map(|obj| py_to_datetime(&obj))
+                    .transpose()?;
+                let timezone = get_str("timezone").unwrap_or_else(|| "UTC".to_string());
+                let jitter = args.and_then(|a| {
+                    a.get_item("jitter")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.extract::<f64>().ok())
+                });
+
+                let t = apsched_triggers::CronTrigger::new(
+                    year.as_deref(),
+                    month.as_deref(),
+                    day.as_deref(),
+                    week.as_deref(),
+                    day_of_week.as_deref(),
+                    hour.as_deref(),
+                    minute.as_deref(),
+                    second.as_deref(),
+                    start_date,
+                    end_date,
+                    timezone,
+                    jitter,
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(Box::new(t))
+            }
+            "calendarinterval" => {
+                let get_i32 = |key: &str, default: i32| -> i32 {
+                    args.and_then(|a| {
+                        a.get_item(key)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<i32>().ok())
+                    })
+                    .unwrap_or(default)
+                };
+                let get_u32 = |key: &str, default: u32| -> u32 {
+                    args.and_then(|a| {
+                        a.get_item(key)
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<u32>().ok())
+                    })
+                    .unwrap_or(default)
+                };
+                let years = get_i32("years", 0);
+                let months = get_i32("months", 0);
+                let weeks = get_i32("weeks", 0);
+                let days = get_i32("days", 0);
+                let hour = get_u32("hour", 0);
+                let minute = get_u32("minute", 0);
+                let second = get_u32("second", 0);
+                let start_date = args
+                    .and_then(|a| a.get_item("start_date").ok().flatten())
+                    .map(|obj| py_to_datetime(&obj))
+                    .transpose()?;
+                let end_date = args
+                    .and_then(|a| a.get_item("end_date").ok().flatten())
+                    .map(|obj| py_to_datetime(&obj))
+                    .transpose()?;
+                let timezone = args
+                    .and_then(|a| {
+                        a.get_item("timezone")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.extract::<String>().ok())
+                    })
+                    .unwrap_or_else(|| "UTC".to_string());
+
+                let t = apsched_triggers::CalendarIntervalTrigger::new(
+                    years, months, weeks, days, hour, minute, second, start_date, end_date,
+                    timezone,
+                )
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(Box::new(t))
+            }
+            other => Err(PyValueError::new_err(format!(
+                "unknown trigger type: '{}'",
+                other
+            ))),
+        };
+    }
+
+    // If it's one of our trigger objects, extract the inner
+    if let Ok(t) = trigger.extract::<PyRef<'_, PyDateTrigger>>() {
+        return Ok(Box::new(t.inner.clone()));
+    }
+    if let Ok(t) = trigger.extract::<PyRef<'_, PyIntervalTrigger>>() {
+        return Ok(Box::new(t.inner.clone()));
+    }
+    if let Ok(t) = trigger.extract::<PyRef<'_, PyCronTrigger>>() {
+        return Ok(Box::new(t.inner.clone()));
+    }
+    if let Ok(t) = trigger.extract::<PyRef<'_, PyCalendarIntervalTrigger>>() {
+        return Ok(Box::new(t.inner.clone()));
+    }
+
+    Err(PyTypeError::new_err(
+        "trigger must be a string name or a trigger object",
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Build a ScheduleSpec from Python arguments
+// ---------------------------------------------------------------------------
+
+fn build_schedule_spec(
+    py: Python<'_>,
+    func: &Bound<'_, PyAny>,
+    trigger: Option<&Bound<'_, PyAny>>,
+    trigger_args: Option<&Bound<'_, PyDict>>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    callable_store: &CallableStore,
+    config: &SchedulerConfig,
+) -> PyResult<ScheduleSpec> {
+    // Resolve the callable
+    let (mut callable_ref, maybe_obj) = resolve_callable(py, func)?;
+    if let Some(obj) = maybe_obj {
+        let handle_id = callable_store.store(obj);
+        callable_ref = CallableRef::InMemoryHandle(handle_id);
+    }
+
+    // Build task spec with args/kwargs from the `args` and `kwargs` keys in kwargs
+    let mut task = TaskSpec::new(callable_ref);
+
+    if let Some(kw) = kwargs {
+        if let Some(args_obj) = kw.get_item("args")?.map(|v| v.unbind()) {
+            let args_bound = args_obj.bind(py);
+            if let Ok(tup) = args_bound.downcast::<PyTuple>() {
+                let (ser_args, _) = serialize_py_args(py, tup, None)?;
+                task.args = ser_args;
+            } else {
+                // Try to convert iterable to tuple
+                let tup = PyTuple::new(py, args_bound.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+                let (ser_args, _) = serialize_py_args(py, &tup, None)?;
+                task.args = ser_args;
+            }
+        }
+        if let Some(kwargs_obj) = kw.get_item("kwargs")?.map(|v| v.unbind()) {
+            let kwargs_bound = kwargs_obj.bind(py);
+            if let Ok(d) = kwargs_bound.downcast::<PyDict>() {
+                let (_, ser_kwargs) = serialize_py_args(py, &PyTuple::empty(py), Some(d))?;
+                task.kwargs = ser_kwargs;
+            }
+        }
+    }
+
+    // Parse trigger
+    let rust_trigger: Box<dyn Trigger> = if let Some(trig) = trigger {
+        parse_trigger(py, trig, trigger_args)?
+    } else {
+        // Default: date trigger (run now)
+        let dt = Utc::now();
+        Box::new(
+            apsched_triggers::DateTrigger::new(dt, config.timezone.clone())
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )
+    };
+
+    let trigger_state = rust_trigger.serialize_state();
+    let now = Utc::now();
+    let next_run_time = rust_trigger.get_next_fire_time(None, now);
+
+    // Extract optional schedule parameters from kwargs
+    let job_id = kwargs
+        .and_then(|kw| {
+            kw.get_item("id")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<String>().ok())
+        })
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let name = kwargs.and_then(|kw| {
+        kw.get_item("name")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<String>().ok())
+    });
+
+    let executor = kwargs
+        .and_then(|kw| {
+            kw.get_item("executor")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<String>().ok())
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    let jobstore = kwargs
+        .and_then(|kw| {
+            kw.get_item("jobstore")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<String>().ok())
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    let max_instances = kwargs
+        .and_then(|kw| {
+            kw.get_item("max_instances")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<u32>().ok())
+        })
+        .unwrap_or(config.job_defaults.max_instances);
+
+    let replace_existing = kwargs
+        .and_then(|kw| {
+            kw.get_item("replace_existing")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<bool>().ok())
+        })
+        .unwrap_or(false);
+
+    let misfire_grace_time = kwargs.and_then(|kw| {
+        kw.get_item("misfire_grace_time")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<f64>().ok())
+            .map(std::time::Duration::from_secs_f64)
+    });
+
+    let coalesce = kwargs
+        .and_then(|kw| {
+            kw.get_item("coalesce")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<bool>().ok())
+        })
+        .map(|b| {
+            if b {
+                CoalescePolicy::On
+            } else {
+                CoalescePolicy::Off
+            }
+        })
+        .unwrap_or(config.job_defaults.coalesce);
+
+    let mut spec = ScheduleSpec::new(job_id, task, trigger_state);
+    spec.name = name;
+    spec.executor = executor;
+    spec.jobstore = jobstore;
+    spec.max_instances = max_instances;
+    spec.replace_existing = replace_existing;
+    spec.coalesce = coalesce;
+    spec.next_run_time = next_run_time;
+    if let Some(grace) = misfire_grace_time {
+        spec.misfire_grace_time = Some(grace);
+    }
+
+    Ok(spec)
+}
+
+// ---------------------------------------------------------------------------
+// Run a Python callable
+// ---------------------------------------------------------------------------
+
+fn run_python_callable(
+    py: Python<'_>,
+    callable_ref: &CallableRef,
+    callable_store: &CallableStore,
+    args: &[SerializedValue],
+    kwargs: &HashMap<String, SerializedValue>,
+) -> PyResult<PyObject> {
+    // Resolve the callable
+    let func: PyObject = match callable_ref {
+        CallableRef::ImportPath(path) => {
+            // path is "module:function"
+            let parts: Vec<&str> = path.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "invalid import path: '{}'",
+                    path
+                )));
+            }
+            let module = py.import(parts[0])?;
+            module.getattr(parts[1])?.into()
+        }
+        CallableRef::InMemoryHandle(id) => callable_store
+            .get(*id)
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(format!("callable handle {} not found", id))
+            })?,
+    };
+
+    // Deserialize args/kwargs
+    let (py_args, py_kwargs) = deserialize_py_args(py, args, kwargs)?;
+
+    // Call the function
+    let args_tuple = py_args.bind(py);
+    let kwargs_dict = py_kwargs.bind(py);
+
+    let args_tuple = args_tuple.downcast::<PyTuple>()?;
+    let kwargs_dict = kwargs_dict.downcast::<PyDict>()?;
+
+    let result = func.bind(py).call(args_tuple, Some(kwargs_dict))?;
+    Ok(result.into())
+}
+
+// ---------------------------------------------------------------------------
+// PyBlockingScheduler
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "BlockingScheduler")]
+pub struct PyBlockingScheduler {
+    engine: Option<Arc<SchedulerEngine>>,
+    callable_store: Arc<CallableStore>,
+    config: SchedulerConfig,
+    pending_jobs: Vec<PendingJob>,
+    stores: HashMap<String, PyObject>,
+    executors: HashMap<String, PyObject>,
+    listeners: Vec<(PyObject, u32)>,
+    started: bool,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[pymethods]
+impl PyBlockingScheduler {
+    #[new]
+    #[pyo3(signature = (**kwargs))]
+    fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let mut config = SchedulerConfig::default();
+
+        if let Some(kw) = kwargs {
+            if let Some(tz) = kw
+                .get_item("timezone")?
+                .and_then(|v| v.extract::<String>().ok())
+            {
+                config.timezone = tz;
+            }
+            if let Some(daemon) = kw
+                .get_item("daemon")?
+                .and_then(|v| v.extract::<bool>().ok())
+            {
+                config.daemon = daemon;
+            }
+            // Parse job_defaults
+            if let Some(jd) = kw.get_item("job_defaults")? {
+                if let Ok(d) = jd.downcast::<PyDict>() {
+                    if let Some(grace) = d
+                        .get_item("misfire_grace_time")?
+                        .and_then(|v| v.extract::<f64>().ok())
+                    {
+                        config.job_defaults.misfire_grace_time =
+                            std::time::Duration::from_secs_f64(grace);
+                    }
+                    if let Some(coalesce) = d
+                        .get_item("coalesce")?
+                        .and_then(|v| v.extract::<bool>().ok())
+                    {
+                        config.job_defaults.coalesce = if coalesce {
+                            CoalescePolicy::On
+                        } else {
+                            CoalescePolicy::Off
+                        };
+                    }
+                    if let Some(max) = d
+                        .get_item("max_instances")?
+                        .and_then(|v| v.extract::<u32>().ok())
+                    {
+                        config.job_defaults.max_instances = max;
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            engine: None,
+            callable_store: Arc::new(CallableStore::new()),
+            config,
+            pending_jobs: Vec::new(),
+            stores: HashMap::new(),
+            executors: HashMap::new(),
+            listeners: Vec::new(),
+            started: false,
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.started {
+            return Err(PyRuntimeError::new_err("scheduler is already running"));
+        }
+
+        let callable_store = Arc::clone(&self.callable_store);
+        let config = self.config.clone();
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        shutdown_flag.store(false, Ordering::Relaxed);
+
+        // Build a tokio runtime and start the engine
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {}", e)))?;
+
+        let engine = Arc::new(SchedulerEngine::new(
+            config,
+            Arc::new(apsched_core::WallClock),
+        ));
+
+        // Add default store if none configured
+        let default_store = Arc::new(MemoryJobStore::new());
+        engine
+            .add_jobstore(default_store, "default")
+            .map_err(scheduler_error_to_pyerr)?;
+
+        // Add default executor
+        let default_executor = Arc::new(apsched_executors::ThreadPoolExecutor::new(10));
+        engine
+            .add_executor(default_executor, "default")
+            .map_err(scheduler_error_to_pyerr)?;
+
+        // Add user-configured stores
+        for (alias, store_obj) in &self.stores {
+            let store_obj_bound = store_obj.bind(py);
+            if let Ok(py_store) = store_obj_bound.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>()
+            {
+                engine
+                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        // Add user-configured executors
+        for (alias, exec_obj) in &self.executors {
+            let exec_obj_bound = exec_obj.bind(py);
+            if let Ok(py_exec) =
+                exec_obj_bound.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
+            {
+                let executor =
+                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                engine
+                    .add_executor(executor, alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        // Register listeners
+        for (callback, mask) in &self.listeners {
+            let cb = callback.clone();
+            let listener_mask = *mask;
+            // We wrap the Python callback in a Rust closure that acquires the GIL
+            engine.add_listener(
+                Arc::new(move |event: &SchedulerEvent| {
+                    Python::with_gil(|py| {
+                        let code = event.event_mask();
+                        let py_event =
+                            crate::events::PySchedulerEvent::new(code, None);
+                        let _ = cb.bind(py).call1((py_event,));
+                    });
+                }),
+                listener_mask,
+            );
+        }
+
+        // Start the engine
+        let engine_clone = Arc::clone(&engine);
+        rt.block_on(async {
+            engine_clone.start().await.map_err(scheduler_error_to_pyerr)
+        })?;
+
+        // Add pending jobs
+        let pending: Vec<PendingJob> = self.pending_jobs.drain(..).collect();
+        for pj in pending {
+            let engine_ref = Arc::clone(&engine);
+            rt.block_on(async {
+                engine_ref
+                    .add_job(pj.spec)
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+        }
+
+        self.engine = Some(Arc::clone(&engine));
+        self.started = true;
+
+        // Block the current thread, releasing the GIL
+        py.allow_threads(move || {
+            // The scheduler loop is running in the tokio runtime.
+            // We just park here until shutdown is signaled.
+            while !shutdown_flag.load(Ordering::Relaxed) {
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
+            }
+
+            // Shut down the engine
+            rt.block_on(async {
+                let _ = engine.shutdown(true).await;
+            });
+        });
+
+        self.started = false;
+        self.engine = None;
+        Ok(())
+    }
+
+    #[pyo3(signature = (wait=None))]
+    fn shutdown(&mut self, py: Python<'_>, wait: Option<bool>) -> PyResult<()> {
+        let _wait = wait.unwrap_or(true);
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+
+        // If we have an engine and it's running from a background context,
+        // trigger the shutdown
+        if let Some(ref engine) = self.engine {
+            // Engine shutdown is handled by the blocking loop detecting the flag
+            // For safety, also signal the engine's internal wakeup
+            engine.wakeup();
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (func, trigger=None, trigger_args=None, **kwargs))]
+    fn add_job(
+        &mut self,
+        py: Python<'_>,
+        func: &Bound<'_, PyAny>,
+        trigger: Option<&Bound<'_, PyAny>>,
+        trigger_args: Option<&Bound<'_, PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let spec = build_schedule_spec(
+            py,
+            func,
+            trigger,
+            trigger_args,
+            kwargs,
+            &self.callable_store,
+            &self.config,
+        )?;
+
+        let py_job = PyJob::from_spec(py, &spec)?;
+
+        if self.started {
+            if let Some(ref engine) = self.engine {
+                // We need a tokio runtime to call async methods
+                // Use tokio's Handle to block on the async call
+                let engine = Arc::clone(engine);
+                let spec_clone = spec;
+                // Use a temporary runtime for this call
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                    })?;
+                rt.block_on(async {
+                    engine
+                        .add_job(spec_clone)
+                        .await
+                        .map_err(scheduler_error_to_pyerr)
+                })?;
+            }
+        } else {
+            self.pending_jobs.push(PendingJob { spec });
+        }
+
+        Ok(py_job.into_pyobject(py)?.into_any().unbind())
+    }
+
+    #[pyo3(signature = (trigger, trigger_args=None, **kwargs))]
+    fn scheduled_job<'py>(
+        &self,
+        py: Python<'py>,
+        trigger: &Bound<'py, PyAny>,
+        trigger_args: Option<&Bound<'py, PyDict>>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<PyObject> {
+        // The scheduled_job decorator requires holding a reference to `self`
+        // across a Python closure boundary, which is not straightforward from
+        // the Rust side. This is best handled in the Python wrapper layer.
+        Err(PyRuntimeError::new_err(
+            "scheduled_job() decorator is not yet supported from Rust extension. \
+             Use add_job() directly instead.",
+        ))
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None, **kwargs))]
+    fn modify_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        if let Some(ref engine) = self.engine {
+            let mut changes = apsched_core::model::JobChanges::default();
+            if let Some(kw) = kwargs {
+                if let Some(name) = kw
+                    .get_item("name")?
+                    .and_then(|v| v.extract::<String>().ok())
+                {
+                    changes.name = Some(name);
+                }
+                if let Some(max) = kw
+                    .get_item("max_instances")?
+                    .and_then(|v| v.extract::<u32>().ok())
+                {
+                    changes.max_instances = Some(max);
+                }
+            }
+
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            let spec = rt.block_on(async {
+                engine
+                    .modify_job(
+                        &job_id_owned,
+                        jobstore_owned.as_deref(),
+                        changes,
+                    )
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None, trigger=None, **kwargs))]
+    fn reschedule_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+        trigger: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        if let Some(ref engine) = self.engine {
+            // First, if a trigger is given, compute new trigger_state and next_run_time
+            let mut changes = apsched_core::model::JobChanges::default();
+
+            if let Some(trig) = trigger {
+                let rust_trigger = parse_trigger(py, trig, None)?;
+                let now = Utc::now();
+                let nrt = rust_trigger.get_next_fire_time(None, now);
+                changes.trigger_state = Some(rust_trigger.serialize_state());
+                changes.next_run_time = Some(nrt);
+            }
+
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            let spec = rt.block_on(async {
+                engine
+                    .modify_job(
+                        &job_id_owned,
+                        jobstore_owned.as_deref(),
+                        changes,
+                    )
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn remove_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            rt.block_on(async {
+                engine
+                    .remove_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })
+        } else {
+            // Remove from pending
+            let initial_len = self.pending_jobs.len();
+            self.pending_jobs.retain(|pj| pj.spec.id != job_id);
+            if self.pending_jobs.len() == initial_len {
+                Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "job '{}' not found",
+                    job_id
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn remove_all_jobs(&mut self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            // The engine doesn't have a remove_all_jobs directly on a store,
+            // but we can get all jobs and remove them
+            let engine = Arc::clone(engine);
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            rt.block_on(async {
+                let jobs = engine
+                    .get_jobs(jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)?;
+                for job in jobs {
+                    let _ = engine
+                        .remove_job(&job.id, jobstore_owned.as_deref())
+                        .await;
+                }
+                Ok(())
+            })
+        } else {
+            if let Some(_store) = jobstore {
+                self.pending_jobs
+                    .retain(|pj| pj.spec.jobstore != _store);
+            } else {
+                self.pending_jobs.clear();
+            }
+            Ok(())
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn get_job(
+        &self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<Option<PyObject>> {
+        if let Some(ref engine) = self.engine {
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            match rt.block_on(async {
+                engine
+                    .get_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+            }) {
+                Ok(spec) => {
+                    let py_job = PyJob::from_spec(py, &spec)?;
+                    Ok(Some(py_job.into_pyobject(py)?.into_any().unbind()))
+                }
+                Err(_) => Ok(None),
+            }
+        } else {
+            // Search pending
+            for pj in &self.pending_jobs {
+                if pj.spec.id == job_id {
+                    let py_job = PyJob::from_spec(py, &pj.spec)?;
+                    return Ok(Some(py_job.into_pyobject(py)?.into_any().unbind()));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn get_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<Vec<PyObject>> {
+        if let Some(ref engine) = self.engine {
+            let engine = Arc::clone(engine);
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            let specs = rt.block_on(async {
+                engine
+                    .get_jobs(jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let mut result = Vec::new();
+            for spec in &specs {
+                let py_job = PyJob::from_spec(py, spec)?;
+                result.push(py_job.into_pyobject(py)?.into_any().unbind());
+            }
+            Ok(result)
+        } else {
+            let mut result = Vec::new();
+            for pj in &self.pending_jobs {
+                if jobstore.is_none() || Some(pj.spec.jobstore.as_str()) == jobstore {
+                    let py_job = PyJob::from_spec(py, &pj.spec)?;
+                    result.push(py_job.into_pyobject(py)?.into_any().unbind());
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn pause_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<PyObject> {
+        if let Some(ref engine) = self.engine {
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            let spec = rt.block_on(async {
+                engine
+                    .pause_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn resume_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<PyObject> {
+        if let Some(ref engine) = self.engine {
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?;
+            let spec = rt.block_on(async {
+                engine
+                    .resume_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn pause(&mut self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.pause().map_err(scheduler_error_to_pyerr)
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn resume(&mut self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.resume().map_err(scheduler_error_to_pyerr)
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn wakeup(&self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.wakeup();
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (callback, mask=None))]
+    fn add_listener(
+        &mut self,
+        py: Python<'_>,
+        callback: PyObject,
+        mask: Option<u32>,
+    ) -> PyResult<()> {
+        let mask = mask.unwrap_or(EVENT_ALL);
+        self.listeners.push((callback.clone(), mask));
+
+        // If already running, add to engine too
+        if let Some(ref engine) = self.engine {
+            let cb = callback;
+            engine.add_listener(
+                Arc::new(move |event: &SchedulerEvent| {
+                    Python::with_gil(|py| {
+                        let code = event.event_mask();
+                        let py_event =
+                            crate::events::PySchedulerEvent::new(code, None);
+                        let _ = cb.bind(py).call1((py_event,));
+                    });
+                }),
+                mask,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn remove_listener(&mut self, py: Python<'_>, callback: PyObject) -> PyResult<()> {
+        // Remove from our list (compare by identity)
+        let cb_ptr = callback.as_ptr();
+        self.listeners.retain(|(cb, _)| cb.as_ptr() != cb_ptr);
+        Ok(())
+    }
+
+    #[pyo3(signature = (jobstore, alias=None, **kwargs))]
+    fn add_jobstore(
+        &mut self,
+        py: Python<'_>,
+        jobstore: &Bound<'_, PyAny>,
+        alias: Option<&str>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let alias = alias.unwrap_or("default").to_string();
+        self.stores
+            .insert(alias.clone(), jobstore.clone().unbind());
+
+        if let Some(ref engine) = self.engine {
+            if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>() {
+                engine
+                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, &alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_jobstore(&mut self, alias: &str) -> PyResult<()> {
+        self.stores.remove(alias);
+        if let Some(ref engine) = self.engine {
+            engine
+                .remove_jobstore(alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (executor, alias=None, **kwargs))]
+    fn add_executor(
+        &mut self,
+        py: Python<'_>,
+        executor: &Bound<'_, PyAny>,
+        alias: Option<&str>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let alias = alias.unwrap_or("default").to_string();
+        self.executors
+            .insert(alias.clone(), executor.clone().unbind());
+
+        if let Some(ref engine) = self.engine {
+            if let Ok(py_exec) =
+                executor.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
+            {
+                let exec =
+                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                engine
+                    .add_executor(exec, &alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_executor(&mut self, alias: &str) -> PyResult<()> {
+        self.executors.remove(alias);
+        if let Some(ref engine) = self.engine {
+            engine
+                .remove_executor(alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn print_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
+        let jobs = self.get_jobs(py, jobstore)?;
+        let builtins = py.import("builtins")?;
+
+        if jobs.is_empty() {
+            builtins.call_method1("print", ("No pending jobs",))?;
+        } else {
+            for job_obj in &jobs {
+                let repr = job_obj.bind(py).repr()?;
+                builtins.call_method1("print", (repr,))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        if self.started {
+            "BlockingScheduler(running=True)".to_string()
+        } else {
+            "BlockingScheduler(running=False)".to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyBackgroundScheduler
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "BackgroundScheduler")]
+pub struct PyBackgroundScheduler {
+    engine: Option<Arc<SchedulerEngine>>,
+    callable_store: Arc<CallableStore>,
+    config: SchedulerConfig,
+    pending_jobs: Vec<PendingJob>,
+    stores: HashMap<String, PyObject>,
+    executors: HashMap<String, PyObject>,
+    listeners: Vec<(PyObject, u32)>,
+    started: bool,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    background_thread: Option<std::thread::JoinHandle<()>>,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+#[pymethods]
+impl PyBackgroundScheduler {
+    #[new]
+    #[pyo3(signature = (**kwargs))]
+    fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let mut config = SchedulerConfig::default();
+
+        if let Some(kw) = kwargs {
+            if let Some(tz) = kw
+                .get_item("timezone")?
+                .and_then(|v| v.extract::<String>().ok())
+            {
+                config.timezone = tz;
+            }
+            if let Some(daemon) = kw
+                .get_item("daemon")?
+                .and_then(|v| v.extract::<bool>().ok())
+            {
+                config.daemon = daemon;
+            }
+            if let Some(jd) = kw.get_item("job_defaults")? {
+                if let Ok(d) = jd.downcast::<PyDict>() {
+                    if let Some(grace) = d
+                        .get_item("misfire_grace_time")?
+                        .and_then(|v| v.extract::<f64>().ok())
+                    {
+                        config.job_defaults.misfire_grace_time =
+                            std::time::Duration::from_secs_f64(grace);
+                    }
+                    if let Some(coalesce) = d
+                        .get_item("coalesce")?
+                        .and_then(|v| v.extract::<bool>().ok())
+                    {
+                        config.job_defaults.coalesce = if coalesce {
+                            CoalescePolicy::On
+                        } else {
+                            CoalescePolicy::Off
+                        };
+                    }
+                    if let Some(max) = d
+                        .get_item("max_instances")?
+                        .and_then(|v| v.extract::<u32>().ok())
+                    {
+                        config.job_defaults.max_instances = max;
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            engine: None,
+            callable_store: Arc::new(CallableStore::new()),
+            config,
+            pending_jobs: Vec::new(),
+            stores: HashMap::new(),
+            executors: HashMap::new(),
+            listeners: Vec::new(),
+            started: false,
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            background_thread: None,
+            runtime: None,
+        })
+    }
+
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.started {
+            return Err(PyRuntimeError::new_err("scheduler is already running"));
+        }
+
+        let config = self.config.clone();
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        shutdown_flag.store(false, Ordering::Relaxed);
+
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?,
+        );
+
+        let engine = Arc::new(SchedulerEngine::new(
+            config,
+            Arc::new(apsched_core::WallClock),
+        ));
+
+        // Add default store
+        let default_store = Arc::new(MemoryJobStore::new());
+        engine
+            .add_jobstore(default_store, "default")
+            .map_err(scheduler_error_to_pyerr)?;
+
+        // Add default executor
+        let default_executor = Arc::new(apsched_executors::ThreadPoolExecutor::new(10));
+        engine
+            .add_executor(default_executor, "default")
+            .map_err(scheduler_error_to_pyerr)?;
+
+        // Add user stores
+        for (alias, store_obj) in &self.stores {
+            let store_obj_bound = store_obj.bind(py);
+            if let Ok(py_store) = store_obj_bound.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>()
+            {
+                engine
+                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        // Add user executors
+        for (alias, exec_obj) in &self.executors {
+            let exec_obj_bound = exec_obj.bind(py);
+            if let Ok(py_exec) =
+                exec_obj_bound.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
+            {
+                let executor =
+                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                engine
+                    .add_executor(executor, alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        // Register listeners
+        for (callback, mask) in &self.listeners {
+            let cb = callback.clone();
+            let listener_mask = *mask;
+            engine.add_listener(
+                Arc::new(move |event: &SchedulerEvent| {
+                    Python::with_gil(|py| {
+                        let code = event.event_mask();
+                        let py_event =
+                            crate::events::PySchedulerEvent::new(code, None);
+                        let _ = cb.bind(py).call1((py_event,));
+                    });
+                }),
+                listener_mask,
+            );
+        }
+
+        // Start the engine
+        let engine_clone = Arc::clone(&engine);
+        let rt_clone = Arc::clone(&rt);
+        rt.block_on(async {
+            engine_clone.start().await.map_err(scheduler_error_to_pyerr)
+        })?;
+
+        // Add pending jobs
+        let pending: Vec<PendingJob> = self.pending_jobs.drain(..).collect();
+        for pj in pending {
+            let engine_ref = Arc::clone(&engine);
+            rt.block_on(async {
+                engine_ref
+                    .add_job(pj.spec)
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+        }
+
+        self.engine = Some(Arc::clone(&engine));
+        self.runtime = Some(Arc::clone(&rt));
+        self.started = true;
+
+        // Spawn a background thread that keeps the runtime alive
+        let engine_bg = Arc::clone(&engine);
+        let shutdown_bg = Arc::clone(&shutdown_flag);
+        let rt_bg = Arc::clone(&rt);
+        let handle = std::thread::Builder::new()
+            .name("apsched-background".to_string())
+            .spawn(move || {
+                while !shutdown_bg.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(100));
+                }
+                rt_bg.block_on(async {
+                    let _ = engine_bg.shutdown(true).await;
+                });
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to spawn thread: {}", e)))?;
+
+        self.background_thread = Some(handle);
+
+        Ok(())
+    }
+
+    #[pyo3(signature = (wait=None))]
+    fn shutdown(&mut self, py: Python<'_>, wait: Option<bool>) -> PyResult<()> {
+        let wait = wait.unwrap_or(true);
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+
+        if let Some(handle) = self.background_thread.take() {
+            handle.thread().unpark();
+            if wait {
+                py.allow_threads(|| {
+                    let _ = handle.join();
+                });
+            }
+        }
+
+        self.started = false;
+        self.engine = None;
+        self.runtime = None;
+        Ok(())
+    }
+
+    #[pyo3(signature = (func, trigger=None, trigger_args=None, **kwargs))]
+    fn add_job(
+        &mut self,
+        py: Python<'_>,
+        func: &Bound<'_, PyAny>,
+        trigger: Option<&Bound<'_, PyAny>>,
+        trigger_args: Option<&Bound<'_, PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let spec = build_schedule_spec(
+            py,
+            func,
+            trigger,
+            trigger_args,
+            kwargs,
+            &self.callable_store,
+            &self.config,
+        )?;
+
+        let py_job = PyJob::from_spec(py, &spec)?;
+
+        if self.started {
+            if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+                let engine = Arc::clone(engine);
+                let rt = Arc::clone(rt);
+                let spec_clone = spec;
+                rt.block_on(async {
+                    engine
+                        .add_job(spec_clone)
+                        .await
+                        .map_err(scheduler_error_to_pyerr)
+                })?;
+            }
+        } else {
+            self.pending_jobs.push(PendingJob { spec });
+        }
+
+        Ok(py_job.into_pyobject(py)?.into_any().unbind())
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn remove_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<()> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            rt.block_on(async {
+                engine
+                    .remove_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })
+        } else {
+            let initial_len = self.pending_jobs.len();
+            self.pending_jobs.retain(|pj| pj.spec.id != job_id);
+            if self.pending_jobs.len() == initial_len {
+                Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "job '{}' not found",
+                    job_id
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn remove_all_jobs(&mut self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            rt.block_on(async {
+                let jobs = engine
+                    .get_jobs(jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)?;
+                for job in jobs {
+                    let _ = engine
+                        .remove_job(&job.id, jobstore_owned.as_deref())
+                        .await;
+                }
+                Ok(())
+            })
+        } else {
+            if let Some(store) = jobstore {
+                self.pending_jobs
+                    .retain(|pj| pj.spec.jobstore != store);
+            } else {
+                self.pending_jobs.clear();
+            }
+            Ok(())
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn get_job(
+        &self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<Option<PyObject>> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            match rt.block_on(async {
+                engine
+                    .get_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+            }) {
+                Ok(spec) => {
+                    let py_job = PyJob::from_spec(py, &spec)?;
+                    Ok(Some(py_job.into_pyobject(py)?.into_any().unbind()))
+                }
+                Err(_) => Ok(None),
+            }
+        } else {
+            for pj in &self.pending_jobs {
+                if pj.spec.id == job_id {
+                    let py_job = PyJob::from_spec(py, &pj.spec)?;
+                    return Ok(Some(py_job.into_pyobject(py)?.into_any().unbind()));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn get_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<Vec<PyObject>> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let specs = rt.block_on(async {
+                engine
+                    .get_jobs(jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let mut result = Vec::new();
+            for spec in &specs {
+                let py_job = PyJob::from_spec(py, spec)?;
+                result.push(py_job.into_pyobject(py)?.into_any().unbind());
+            }
+            Ok(result)
+        } else {
+            let mut result = Vec::new();
+            for pj in &self.pending_jobs {
+                if jobstore.is_none() || Some(pj.spec.jobstore.as_str()) == jobstore {
+                    let py_job = PyJob::from_spec(py, &pj.spec)?;
+                    result.push(py_job.into_pyobject(py)?.into_any().unbind());
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn pause_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<PyObject> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let spec = rt.block_on(async {
+                engine
+                    .pause_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn resume_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<PyObject> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let spec = rt.block_on(async {
+                engine
+                    .resume_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn pause(&mut self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.pause().map_err(scheduler_error_to_pyerr)
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn resume(&mut self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.resume().map_err(scheduler_error_to_pyerr)
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn wakeup(&self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.wakeup();
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (callback, mask=None))]
+    fn add_listener(
+        &mut self,
+        py: Python<'_>,
+        callback: PyObject,
+        mask: Option<u32>,
+    ) -> PyResult<()> {
+        let mask = mask.unwrap_or(EVENT_ALL);
+        self.listeners.push((callback.clone(), mask));
+
+        if let Some(ref engine) = self.engine {
+            let cb = callback;
+            engine.add_listener(
+                Arc::new(move |event: &SchedulerEvent| {
+                    Python::with_gil(|py| {
+                        let code = event.event_mask();
+                        let py_event =
+                            crate::events::PySchedulerEvent::new(code, None);
+                        let _ = cb.bind(py).call1((py_event,));
+                    });
+                }),
+                mask,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn remove_listener(&mut self, py: Python<'_>, callback: PyObject) -> PyResult<()> {
+        let cb_ptr = callback.as_ptr();
+        self.listeners.retain(|(cb, _)| cb.as_ptr() != cb_ptr);
+        Ok(())
+    }
+
+    #[pyo3(signature = (jobstore, alias=None, **kwargs))]
+    fn add_jobstore(
+        &mut self,
+        py: Python<'_>,
+        jobstore: &Bound<'_, PyAny>,
+        alias: Option<&str>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let alias = alias.unwrap_or("default").to_string();
+        self.stores
+            .insert(alias.clone(), jobstore.clone().unbind());
+
+        if let Some(ref engine) = self.engine {
+            if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyMemoryJobStore>>() {
+                engine
+                    .add_jobstore(Arc::clone(&py_store.inner) as Arc<dyn JobStore>, &alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_jobstore(&mut self, alias: &str) -> PyResult<()> {
+        self.stores.remove(alias);
+        if let Some(ref engine) = self.engine {
+            engine
+                .remove_jobstore(alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (executor, alias=None, **kwargs))]
+    fn add_executor(
+        &mut self,
+        py: Python<'_>,
+        executor: &Bound<'_, PyAny>,
+        alias: Option<&str>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let alias = alias.unwrap_or("default").to_string();
+        self.executors
+            .insert(alias.clone(), executor.clone().unbind());
+
+        if let Some(ref engine) = self.engine {
+            if let Ok(py_exec) =
+                executor.extract::<PyRef<'_, crate::executors::PyThreadPoolExecutor>>()
+            {
+                let exec =
+                    Arc::new(apsched_executors::ThreadPoolExecutor::new(py_exec.max_workers));
+                engine
+                    .add_executor(exec, &alias)
+                    .map_err(scheduler_error_to_pyerr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_executor(&mut self, alias: &str) -> PyResult<()> {
+        self.executors.remove(alias);
+        if let Some(ref engine) = self.engine {
+            engine
+                .remove_executor(alias)
+                .map_err(scheduler_error_to_pyerr)?;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn print_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
+        let jobs = self.get_jobs(py, jobstore)?;
+        let builtins = py.import("builtins")?;
+
+        if jobs.is_empty() {
+            builtins.call_method1("print", ("No pending jobs",))?;
+        } else {
+            for job_obj in &jobs {
+                let repr = job_obj.bind(py).repr()?;
+                builtins.call_method1("print", (repr,))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        if self.started {
+            "BackgroundScheduler(running=True)".to_string()
+        } else {
+            "BackgroundScheduler(running=False)".to_string()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyAsyncIOScheduler
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "AsyncIOScheduler")]
+pub struct PyAsyncIOScheduler {
+    engine: Option<Arc<SchedulerEngine>>,
+    callable_store: Arc<CallableStore>,
+    config: SchedulerConfig,
+    pending_jobs: Vec<PendingJob>,
+    stores: HashMap<String, PyObject>,
+    executors: HashMap<String, PyObject>,
+    listeners: Vec<(PyObject, u32)>,
+    started: bool,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+#[pymethods]
+impl PyAsyncIOScheduler {
+    #[new]
+    #[pyo3(signature = (**kwargs))]
+    fn new(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let mut config = SchedulerConfig::default();
+
+        if let Some(kw) = kwargs {
+            if let Some(tz) = kw
+                .get_item("timezone")?
+                .and_then(|v| v.extract::<String>().ok())
+            {
+                config.timezone = tz;
+            }
+            if let Some(jd) = kw.get_item("job_defaults")? {
+                if let Ok(d) = jd.downcast::<PyDict>() {
+                    if let Some(grace) = d
+                        .get_item("misfire_grace_time")?
+                        .and_then(|v| v.extract::<f64>().ok())
+                    {
+                        config.job_defaults.misfire_grace_time =
+                            std::time::Duration::from_secs_f64(grace);
+                    }
+                    if let Some(coalesce) = d
+                        .get_item("coalesce")?
+                        .and_then(|v| v.extract::<bool>().ok())
+                    {
+                        config.job_defaults.coalesce = if coalesce {
+                            CoalescePolicy::On
+                        } else {
+                            CoalescePolicy::Off
+                        };
+                    }
+                    if let Some(max) = d
+                        .get_item("max_instances")?
+                        .and_then(|v| v.extract::<u32>().ok())
+                    {
+                        config.job_defaults.max_instances = max;
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            engine: None,
+            callable_store: Arc::new(CallableStore::new()),
+            config,
+            pending_jobs: Vec::new(),
+            stores: HashMap::new(),
+            executors: HashMap::new(),
+            listeners: Vec::new(),
+            started: false,
+            runtime: None,
+        })
+    }
+
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.started {
+            return Err(PyRuntimeError::new_err("scheduler is already running"));
+        }
+
+        let config = self.config.clone();
+
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("failed to create runtime: {}", e))
+                })?,
+        );
+
+        let engine = Arc::new(SchedulerEngine::new(
+            config,
+            Arc::new(apsched_core::WallClock),
+        ));
+
+        // Add default store
+        let default_store = Arc::new(MemoryJobStore::new());
+        engine
+            .add_jobstore(default_store, "default")
+            .map_err(scheduler_error_to_pyerr)?;
+
+        // Add default executor
+        let default_executor = Arc::new(apsched_executors::ThreadPoolExecutor::new(10));
+        engine
+            .add_executor(default_executor, "default")
+            .map_err(scheduler_error_to_pyerr)?;
+
+        // Register listeners
+        for (callback, mask) in &self.listeners {
+            let cb = callback.clone();
+            let listener_mask = *mask;
+            engine.add_listener(
+                Arc::new(move |event: &SchedulerEvent| {
+                    Python::with_gil(|py| {
+                        let code = event.event_mask();
+                        let py_event =
+                            crate::events::PySchedulerEvent::new(code, None);
+                        let _ = cb.bind(py).call1((py_event,));
+                    });
+                }),
+                listener_mask,
+            );
+        }
+
+        // Start the engine
+        let engine_clone = Arc::clone(&engine);
+        rt.block_on(async {
+            engine_clone.start().await.map_err(scheduler_error_to_pyerr)
+        })?;
+
+        // Add pending jobs
+        let pending: Vec<PendingJob> = self.pending_jobs.drain(..).collect();
+        for pj in pending {
+            let engine_ref = Arc::clone(&engine);
+            rt.block_on(async {
+                engine_ref
+                    .add_job(pj.spec)
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+        }
+
+        self.engine = Some(engine);
+        self.runtime = Some(rt);
+        self.started = true;
+
+        Ok(())
+    }
+
+    #[pyo3(signature = (wait=None))]
+    fn shutdown(&mut self, py: Python<'_>, wait: Option<bool>) -> PyResult<()> {
+        let wait = wait.unwrap_or(true);
+        if let (Some(engine), Some(rt)) = (self.engine.take(), self.runtime.take()) {
+            rt.block_on(async {
+                let _ = engine.shutdown(wait).await;
+            });
+        }
+        self.started = false;
+        Ok(())
+    }
+
+    #[pyo3(signature = (func, trigger=None, trigger_args=None, **kwargs))]
+    fn add_job(
+        &mut self,
+        py: Python<'_>,
+        func: &Bound<'_, PyAny>,
+        trigger: Option<&Bound<'_, PyAny>>,
+        trigger_args: Option<&Bound<'_, PyDict>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let spec = build_schedule_spec(
+            py,
+            func,
+            trigger,
+            trigger_args,
+            kwargs,
+            &self.callable_store,
+            &self.config,
+        )?;
+
+        let py_job = PyJob::from_spec(py, &spec)?;
+
+        if self.started {
+            if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+                let engine = Arc::clone(engine);
+                let spec_clone = spec;
+                rt.block_on(async {
+                    engine
+                        .add_job(spec_clone)
+                        .await
+                        .map_err(scheduler_error_to_pyerr)
+                })?;
+            }
+        } else {
+            self.pending_jobs.push(PendingJob { spec });
+        }
+
+        Ok(py_job.into_pyobject(py)?.into_any().unbind())
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None))]
+    fn remove_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+    ) -> PyResult<()> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            rt.block_on(async {
+                engine
+                    .remove_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })
+        } else {
+            let initial_len = self.pending_jobs.len();
+            self.pending_jobs.retain(|pj| pj.spec.id != job_id);
+            if self.pending_jobs.len() == initial_len {
+                Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "job '{}' not found",
+                    job_id
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn get_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<Vec<PyObject>> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let specs = rt.block_on(async {
+                engine
+                    .get_jobs(jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let mut result = Vec::new();
+            for spec in &specs {
+                let py_job = PyJob::from_spec(py, spec)?;
+                result.push(py_job.into_pyobject(py)?.into_any().unbind());
+            }
+            Ok(result)
+        } else {
+            let mut result = Vec::new();
+            for pj in &self.pending_jobs {
+                if jobstore.is_none() || Some(pj.spec.jobstore.as_str()) == jobstore {
+                    let py_job = PyJob::from_spec(py, &pj.spec)?;
+                    result.push(py_job.into_pyobject(py)?.into_any().unbind());
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    fn pause(&mut self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.pause().map_err(scheduler_error_to_pyerr)
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn resume(&mut self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.resume().map_err(scheduler_error_to_pyerr)
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    fn wakeup(&self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.wakeup();
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (callback, mask=None))]
+    fn add_listener(
+        &mut self,
+        py: Python<'_>,
+        callback: PyObject,
+        mask: Option<u32>,
+    ) -> PyResult<()> {
+        let mask = mask.unwrap_or(EVENT_ALL);
+        self.listeners.push((callback.clone(), mask));
+
+        if let Some(ref engine) = self.engine {
+            let cb = callback;
+            engine.add_listener(
+                Arc::new(move |event: &SchedulerEvent| {
+                    Python::with_gil(|py| {
+                        let code = event.event_mask();
+                        let py_event =
+                            crate::events::PySchedulerEvent::new(code, None);
+                        let _ = cb.bind(py).call1((py_event,));
+                    });
+                }),
+                mask,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn remove_listener(&mut self, py: Python<'_>, callback: PyObject) -> PyResult<()> {
+        let cb_ptr = callback.as_ptr();
+        self.listeners.retain(|(cb, _)| cb.as_ptr() != cb_ptr);
+        Ok(())
+    }
+
+    #[pyo3(signature = (jobstore=None))]
+    fn print_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
+        let jobs = self.get_jobs(py, jobstore)?;
+        let builtins = py.import("builtins")?;
+
+        if jobs.is_empty() {
+            builtins.call_method1("print", ("No pending jobs",))?;
+        } else {
+            for job_obj in &jobs {
+                let repr = job_obj.bind(py).repr()?;
+                builtins.call_method1("print", (repr,))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        if self.started {
+            "AsyncIOScheduler(running=True)".to_string()
+        } else {
+            "AsyncIOScheduler(running=False)".to_string()
+        }
+    }
+}

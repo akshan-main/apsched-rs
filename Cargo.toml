@@ -38,7 +38,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Python bindings
-pyo3 = { version = "0.23", features = ["extension-module", "chrono", "anyhow"] }
+pyo3 = { version = "0.23", features = ["extension-module", "chrono", "anyhow", "py-clone"] }
 
 # Data structures
 dashmap = "6"
