@@ -1690,6 +1690,151 @@ impl PyBackgroundScheduler {
         Ok(py_job.into_pyobject(py)?.into_any().unbind())
     }
 
+    #[pyo3(signature = (trigger, trigger_args=None, **kwargs))]
+    fn scheduled_job<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        trigger: &Bound<'py, PyAny>,
+        trigger_args: Option<&Bound<'py, PyDict>>,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let scheduler = slf.clone().unbind();
+        let trigger_obj = trigger.clone().unbind();
+        let trigger_args_obj = trigger_args.map(|d| d.clone().unbind());
+        let kwargs_obj = kwargs.map(|d| d.clone().unbind());
+
+        let decorator = pyo3::types::PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &Bound<'_, PyTuple>, _kw: Option<&Bound<'_, PyDict>>| -> PyResult<PyObject> {
+                let py = args.py();
+                let func = args.get_item(0)?;
+
+                let trigger_bound = trigger_obj.bind(py);
+                let trigger_args_bound = trigger_args_obj.as_ref().map(|d| d.bind(py));
+                let kwargs_bound = kwargs_obj.as_ref().map(|d| d.bind(py));
+
+                let mut sched = scheduler.bind(py).borrow_mut();
+                let trigger_args_ref = trigger_args_bound.map(|b| {
+                    b.downcast::<PyDict>().unwrap()
+                });
+                let kwargs_ref = kwargs_bound.map(|b| {
+                    b.downcast::<PyDict>().unwrap()
+                });
+
+                sched.add_job(
+                    py,
+                    &func,
+                    Some(trigger_bound),
+                    trigger_args_ref.as_deref(),
+                    kwargs_ref.as_deref(),
+                )?;
+
+                Ok(func.clone().unbind())
+            },
+        )?;
+
+        Ok(decorator.into())
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None, trigger=None, **kwargs))]
+    fn reschedule_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+        trigger: Option<&Bound<'_, PyAny>>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let mut changes = apsched_core::model::JobChanges::default();
+
+            // Build trigger from string or trigger object, plus any kwargs
+            let actual_trigger = if let Some(trig) = trigger {
+                Some(parse_trigger(py, trig, kwargs)?)
+            } else {
+                None
+            };
+
+            if let Some(rust_trigger) = actual_trigger {
+                let now = Utc::now();
+                let nrt = rust_trigger.get_next_fire_time(None, now);
+                changes.trigger_state = Some(rust_trigger.serialize_state());
+                changes.next_run_time = Some(nrt);
+            }
+
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let spec = rt.block_on(async {
+                engine
+                    .modify_job(
+                        &job_id_owned,
+                        jobstore_owned.as_deref(),
+                        changes,
+                    )
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    #[pyo3(signature = (job_id, jobstore=None, **kwargs))]
+    fn modify_job(
+        &mut self,
+        py: Python<'_>,
+        job_id: &str,
+        jobstore: Option<&str>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let mut changes = apsched_core::model::JobChanges::default();
+            if let Some(kw) = kwargs {
+                if let Some(name) = kw
+                    .get_item("name")?
+                    .and_then(|v| v.extract::<String>().ok())
+                {
+                    changes.name = Some(name);
+                }
+                if let Some(max) = kw
+                    .get_item("max_instances")?
+                    .and_then(|v| v.extract::<u32>().ok())
+                {
+                    changes.max_instances = Some(max);
+                }
+            }
+
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            let spec = rt.block_on(async {
+                engine
+                    .modify_job(
+                        &job_id_owned,
+                        jobstore_owned.as_deref(),
+                        changes,
+                    )
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
+            let py_job = PyJob::from_spec(py, &spec)?;
+            Ok(py_job.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
     #[pyo3(signature = (job_id, jobstore=None))]
     fn remove_job(
         &mut self,

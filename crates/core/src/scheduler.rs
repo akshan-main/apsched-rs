@@ -779,13 +779,19 @@ impl SchedulerLoopContext {
                     scheduled_run_time: fire_time,
                 });
 
-                // Update next_run_time to skip this execution
+                // Advance to the next fire time (skip the missed execution)
+                let next = schedule
+                    .trigger_state
+                    .compute_next_fire_time(fire_time, now);
                 let store = {
                     let stores = self.stores.read();
                     stores.get(store_alias).cloned()
                 };
                 if let Some(store) = store {
-                    let _ = store.update_next_run_time(job_id, None).await;
+                    let _ = store.update_next_run_time(job_id, next).await;
+                }
+                if next.is_some() {
+                    self.wakeup_notify.notify_one();
                 }
                 return;
             }
