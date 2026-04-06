@@ -6,7 +6,7 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use apsched_core::error::ExecutorError;
 use apsched_core::event::{SchedulerEvent, EVENT_ALL};
@@ -18,6 +18,7 @@ use apsched_core::model::{JobOutcome, JobResultEnvelope, JobSpec};
 use apsched_core::traits::{Executor, JobStore, Trigger};
 use apsched_core::SchedulerEngine;
 use apsched_store::MemoryJobStore;
+use apsched_store::RedisJobStore;
 use apsched_store::SqlJobStore;
 
 use crate::convert::{
@@ -36,6 +37,7 @@ use crate::triggers::{PyCalendarIntervalTrigger, PyCronTrigger, PyDateTrigger, P
 enum PendingStore {
     Memory(Arc<MemoryJobStore>),
     Sql { url: String, tablename: String },
+    Redis { url: String, prefix: String },
 }
 
 impl PendingStore {
@@ -51,6 +53,14 @@ impl PendingStore {
                     })?;
                 Ok(Arc::new(store) as Arc<dyn JobStore>)
             }
+            PendingStore::Redis { url, prefix } => {
+                let store = rt
+                    .block_on(RedisJobStore::new(&url, Some(&prefix)))
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("Failed to create Redis store: {}", e))
+                    })?;
+                Ok(Arc::new(store) as Arc<dyn JobStore>)
+            }
         }
     }
 }
@@ -60,8 +70,9 @@ impl PendingStore {
 /// Supports:
 /// - `PyMemoryJobStore` instances
 /// - `PySqlJobStore` instances (url/tablename config)
-/// - String aliases: `"memory"`, `"sqlite"`, `"sqlalchemy"` (the latter two
-///   require a `url` kwarg)
+/// - `PyRedisJobStore` instances (url/prefix config)
+/// - String aliases: `"memory"`, `"sqlite"`, `"sqlalchemy"`, `"postgresql"`,
+///   `"postgres"`, `"redis"`
 fn parse_jobstore(
     jobstore: &Bound<'_, PyAny>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -75,6 +86,13 @@ fn parse_jobstore(
         return Ok(PendingStore::Sql {
             url: py_store.url.clone(),
             tablename: py_store.tablename.clone(),
+        });
+    }
+    // Try PyRedisJobStore
+    if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyRedisJobStore>>() {
+        return Ok(PendingStore::Redis {
+            url: py_store.url.clone(),
+            prefix: py_store.prefix.clone(),
         });
     }
     // Try string alias
@@ -98,16 +116,46 @@ fn parse_jobstore(
                     .unwrap_or_else(|| "apscheduler_jobs".to_string());
                 return Ok(PendingStore::Sql { url, tablename });
             }
+            "postgresql" | "postgres" => {
+                let url = kwargs
+                    .and_then(|kw| kw.get_item("url").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .ok_or_else(|| {
+                        PyValueError::new_err(
+                            "A 'url' keyword argument is required for postgresql stores",
+                        )
+                    })?;
+                let tablename = kwargs
+                    .and_then(|kw| kw.get_item("tablename").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_else(|| "apscheduler_jobs".to_string());
+                return Ok(PendingStore::Sql { url, tablename });
+            }
+            "redis" => {
+                let url = kwargs
+                    .and_then(|kw| kw.get_item("url").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .ok_or_else(|| {
+                        PyValueError::new_err(
+                            "A 'url' keyword argument is required for redis stores",
+                        )
+                    })?;
+                let prefix = kwargs
+                    .and_then(|kw| kw.get_item("prefix").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_else(|| "apscheduler:".to_string());
+                return Ok(PendingStore::Redis { url, prefix });
+            }
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "Unknown jobstore type: '{}'. Use 'memory', 'sqlite', or 'sqlalchemy'",
+                    "Unknown jobstore type: '{}'. Use 'memory', 'sqlite', 'sqlalchemy', 'postgresql', 'postgres', or 'redis'",
                     other
                 )));
             }
         }
     }
     Err(PyTypeError::new_err(
-        "jobstore must be a MemoryJobStore, SqlJobStore, or a string alias ('memory', 'sqlite', 'sqlalchemy')",
+        "jobstore must be a MemoryJobStore, SqlJobStore, RedisJobStore, or a string alias ('memory', 'sqlite', 'sqlalchemy', 'postgresql', 'postgres', 'redis')",
     ))
 }
 
@@ -1754,9 +1802,10 @@ pub struct PyBackgroundScheduler {
     background_thread: Option<std::thread::JoinHandle<()>>,
     runtime: Option<Arc<tokio::runtime::Runtime>>,
     start_time: Option<std::time::Instant>,
-    /// Cache of PyJob objects keyed by job ID, so get_jobs() returns cached
-    /// objects without round-tripping through the Rust engine.
-    jobs_cache: HashMap<String, PyObject>,
+    /// Cache of PyJob objects as a Python dict {job_id: PyJob}, so get_jobs()
+    /// returns cached objects without round-tripping through the Rust engine.
+    /// Using a Python dict instead of Rust HashMap avoids per-item FFI overhead.
+    jobs_cache: PyObject,
 }
 
 #[pymethods]
@@ -1822,7 +1871,7 @@ impl PyBackgroundScheduler {
             background_thread: None,
             runtime: None,
             start_time: None,
-            jobs_cache: HashMap::new(),
+            jobs_cache: Python::with_gil(|py| PyDict::new(py).unbind().into()),
         })
     }
 
@@ -1997,8 +2046,10 @@ impl PyBackgroundScheduler {
         let py_job = PyJob::from_spec(py, &spec)?;
         let py_job_obj = py_job.into_pyobject(py)?.into_any().unbind();
 
-        // Cache the PyJob object and invalidate list cache
-        self.jobs_cache.insert(job_id, py_job_obj.clone_ref(py));
+        // Cache the PyJob object in the Python dict
+        self.jobs_cache
+            .downcast_bound::<PyDict>(py)?
+            .set_item(&job_id, py_job_obj.clone_ref(py))?;
 
         if self.started {
             if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
@@ -2151,7 +2202,8 @@ impl PyBackgroundScheduler {
             let py_job_obj = py_job.into_pyobject(py)?.into_any().unbind();
             // Update caches
             self.jobs_cache
-                .insert(job_id.to_string(), py_job_obj.clone_ref(py));
+                .downcast_bound::<PyDict>(py)?
+                .set_item(job_id, py_job_obj.clone_ref(py))?;
 
             Ok(py_job_obj)
         } else {
@@ -2161,7 +2213,10 @@ impl PyBackgroundScheduler {
 
     #[pyo3(signature = (job_id, jobstore=None))]
     fn remove_job(&mut self, py: Python<'_>, job_id: &str, jobstore: Option<&str>) -> PyResult<()> {
-        self.jobs_cache.remove(job_id);
+        let _ = self
+            .jobs_cache
+            .downcast_bound::<PyDict>(py)
+            .map(|d| d.del_item(job_id));
 
         if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
             let engine = Arc::clone(engine);
@@ -2191,21 +2246,26 @@ impl PyBackgroundScheduler {
 
     #[pyo3(signature = (jobstore=None))]
     fn remove_all_jobs(&mut self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
-        // Clear caches
-        self.jobs_cache.clear();
+        // Clear caches - Python dict.clear() is O(1) in CPython
+        if let Ok(dict) = self.jobs_cache.downcast_bound::<PyDict>(py) {
+            dict.clear();
+        }
 
         if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
             let engine = Arc::clone(engine);
             let rt = Arc::clone(rt);
             let jobstore_owned = jobstore.map(|s| s.to_string());
 
-            // Use bulk remove_all_jobs instead of iterating one-by-one
-            rt.block_on(async {
-                engine
-                    .remove_all_jobs(jobstore_owned.as_deref())
-                    .await
-                    .map_err(scheduler_error_to_pyerr)
-            })
+            // Must be synchronous — fire-and-forget breaks add_job after remove_all
+            py.allow_threads(|| {
+                rt.block_on(async {
+                    engine
+                        .remove_all_jobs(jobstore_owned.as_deref())
+                        .await
+                        .map_err(scheduler_error_to_pyerr)
+                })
+            })?;
+            Ok(())
         } else {
             if let Some(store) = jobstore {
                 self.pending_jobs.retain(|pj| pj.spec.jobstore != store);
@@ -2252,15 +2312,15 @@ impl PyBackgroundScheduler {
     }
 
     #[pyo3(signature = (jobstore=None))]
-    fn get_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<Vec<PyObject>> {
-        // Fast path: build from cached PyJob objects without touching the engine.
-        if !self.jobs_cache.is_empty() {
-            let result: Vec<PyObject> = self
-                .jobs_cache
-                .values()
-                .map(|obj| obj.clone_ref(py))
-                .collect();
-            return Ok(result);
+    fn get_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<PyObject> {
+        // Fast path: call list(dict.values()) entirely in Python — zero per-item
+        // Rust iteration, matching APScheduler's dict-based approach.
+        if let Ok(dict) = self.jobs_cache.downcast_bound::<PyDict>(py) {
+            if !dict.is_empty() {
+                let builtins = py.import("builtins")?;
+                let list_fn = builtins.getattr("list")?;
+                return Ok(list_fn.call1((dict.values(),))?.unbind());
+            }
         }
         if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
             let engine = Arc::clone(engine);
@@ -2279,7 +2339,7 @@ impl PyBackgroundScheduler {
                 let py_job = PyJob::from_spec(py, spec)?;
                 result.push(py_job.into_pyobject(py)?.into_any().unbind());
             }
-            Ok(result)
+            Ok(PyList::new(py, &result)?.into_any().unbind())
         } else {
             let mut result = Vec::new();
             for pj in &self.pending_jobs {
@@ -2288,7 +2348,7 @@ impl PyBackgroundScheduler {
                     result.push(py_job.into_pyobject(py)?.into_any().unbind());
                 }
             }
-            Ok(result)
+            Ok(PyList::new(py, &result)?.into_any().unbind())
         }
     }
 
@@ -2483,14 +2543,15 @@ impl PyBackgroundScheduler {
 
     #[pyo3(signature = (jobstore=None))]
     fn print_jobs(&self, py: Python<'_>, jobstore: Option<&str>) -> PyResult<()> {
-        let jobs = self.get_jobs(py, jobstore)?;
+        let jobs_obj = self.get_jobs(py, jobstore)?;
+        let jobs = jobs_obj.downcast_bound::<PyList>(py)?;
         let builtins = py.import("builtins")?;
 
         if jobs.is_empty() {
             builtins.call_method1("print", ("No pending jobs",))?;
         } else {
-            for job_obj in &jobs {
-                let repr = job_obj.bind(py).repr()?;
+            for job_obj in jobs.iter() {
+                let repr = job_obj.repr()?;
                 builtins.call_method1("print", (repr,))?;
             }
         }

@@ -268,9 +268,16 @@ impl SchedulerEngine {
                 jobstore: alias.to_string(),
             });
         } else {
-            let stores = self.stores.read();
+            // Clone stores out of the lock so we don't hold it across await.
+            let store_snapshot: Vec<(String, Arc<dyn JobStore>)> = {
+                let stores = self.stores.read();
+                stores
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect()
+            };
             let mut found = false;
-            for (alias, store) in stores.iter() {
+            for (alias, store) in &store_snapshot {
                 if store.remove_job(job_id).await.is_ok() {
                     self.event_bus.emit(&SchedulerEvent::JobRemoved {
                         job_id: job_id.to_string(),
@@ -302,8 +309,12 @@ impl SchedulerEngine {
                 .await
                 .map_err(SchedulerError::StoreError)
         } else {
-            let stores = self.stores.read();
-            for (_alias, store) in stores.iter() {
+            // Clone stores out of the lock so we don't hold it across await.
+            let store_snapshot: Vec<Arc<dyn JobStore>> = {
+                let stores = self.stores.read();
+                stores.values().cloned().collect()
+            };
+            for store in &store_snapshot {
                 if let Ok(spec) = store.get_job(job_id).await {
                     return Ok(spec);
                 }
@@ -323,8 +334,11 @@ impl SchedulerEngine {
                 .await
                 .map_err(SchedulerError::StoreError)
         } else {
-            let stores = self.stores.read();
-            for (_alias, store) in stores.iter() {
+            let store_snapshot: Vec<Arc<dyn JobStore>> = {
+                let stores = self.stores.read();
+                stores.values().cloned().collect()
+            };
+            for store in &store_snapshot {
                 if let Err(e) = store.remove_all_jobs().await {
                     tracing::warn!("error removing all jobs from store: {}", e);
                 }
@@ -345,9 +359,12 @@ impl SchedulerEngine {
                 .await
                 .map_err(SchedulerError::StoreError)
         } else {
-            let stores = self.stores.read();
+            let store_snapshot: Vec<Arc<dyn JobStore>> = {
+                let stores = self.stores.read();
+                stores.values().cloned().collect()
+            };
             let mut all = Vec::new();
-            for (_alias, store) in stores.iter() {
+            for store in &store_snapshot {
                 match store.get_all_jobs().await {
                     Ok(jobs) => all.extend(jobs),
                     Err(e) => {

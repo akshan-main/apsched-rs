@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
-use sqlx::Row;
+use sqlx::any::{AnyPoolOptions, AnyRow};
+use sqlx::{AnyPool, Row};
 
 use apsched_core::error::StoreError;
 use apsched_core::model::{JobLease, ScheduleSpec};
@@ -10,28 +10,52 @@ use apsched_core::traits::JobStore;
 /// Default lease duration for acquired jobs (30 seconds).
 const DEFAULT_LEASE_DURATION_SECS: i64 = 30;
 
-/// SQL-backed job store using sqlx with SQLite.
+/// Database backend detected from the connection URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbBackend {
+    Sqlite,
+    Postgres,
+}
+
+/// SQL-backed job store using sqlx with AnyPool.
 ///
-/// Supports:
-/// - Auto-schema creation on startup
-/// - Optimistic locking via a `version` column
-/// - Lease-based job acquisition for multi-worker coordination
-/// - JSON serialization of `ScheduleSpec`
+/// Supports both SQLite and PostgreSQL, auto-detected from the connection URL.
+///
+/// Key differences by backend:
+/// - **SQLite**: uses `INTEGER` for booleans, optimistic locking for `acquire_jobs`
+/// - **PostgreSQL**: uses `BOOLEAN` columns, `FOR UPDATE SKIP LOCKED` for
+///   lock-free distributed job acquisition
 #[derive(Debug, Clone)]
 pub struct SqlJobStore {
-    pool: SqlitePool,
+    pool: AnyPool,
     table_name: String,
+    backend: DbBackend,
 }
 
 impl SqlJobStore {
     /// Create a new SQL job store by connecting to the given database URL.
     ///
     /// # Arguments
-    /// * `database_url` - A SQLite connection string (e.g., `sqlite::memory:`, `sqlite://jobs.db`).
+    /// * `database_url` - A connection string. Prefixes:
+    ///   - `sqlite:` for SQLite (e.g. `sqlite::memory:`, `sqlite://jobs.db`)
+    ///   - `postgres:` or `postgresql:` for PostgreSQL
     /// * `table_name` - Optional table name override; defaults to `"apscheduler_jobs"`.
     pub async fn new(database_url: &str, table_name: Option<&str>) -> Result<Self, StoreError> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+        // Install AnyPool drivers
+        sqlx::any::install_default_drivers();
+
+        let backend = Self::detect_backend(database_url)?;
+
+        // For in-memory SQLite, limit to 1 connection so all queries
+        // share the same in-memory database.
+        let max_conns = if database_url.contains(":memory:") {
+            1
+        } else {
+            5
+        };
+
+        let pool = AnyPoolOptions::new()
+            .max_connections(max_conns)
             .connect(database_url)
             .await
             .map_err(|e| StoreError::ConnectionFailed(e.to_string()))?;
@@ -39,22 +63,51 @@ impl SqlJobStore {
         let store = Self {
             pool,
             table_name: table_name.unwrap_or("apscheduler_jobs").to_string(),
+            backend,
         };
 
         store.create_schema().await?;
         Ok(store)
     }
 
+    /// Detect the database backend from the URL prefix.
+    fn detect_backend(url: &str) -> Result<DbBackend, StoreError> {
+        if url.starts_with("sqlite:") {
+            Ok(DbBackend::Sqlite)
+        } else if url.starts_with("postgres:") || url.starts_with("postgresql:") {
+            Ok(DbBackend::Postgres)
+        } else {
+            Err(StoreError::ConnectionFailed(format!(
+                "Unsupported database URL prefix. Expected 'sqlite:', 'postgres:', or 'postgresql:'. Got: {}",
+                url.split(':').next().unwrap_or("(empty)")
+            )))
+        }
+    }
+
+    /// Get the SQL placeholder for the given 1-based parameter index.
+    /// SQLite uses `?`, Postgres uses `$1`, `$2`, etc.
+    fn placeholder(&self, index: usize) -> String {
+        match self.backend {
+            DbBackend::Sqlite => "?".to_string(),
+            DbBackend::Postgres => format!("${}", index),
+        }
+    }
+
     /// Create the jobs table and index if they don't exist.
     async fn create_schema(&self) -> Result<(), StoreError> {
+        let (paused_type, paused_default) = match self.backend {
+            DbBackend::Sqlite => ("INTEGER", "0"),
+            DbBackend::Postgres => ("BOOLEAN", "FALSE"),
+        };
+
         let create_table = format!(
-            r#"CREATE TABLE IF NOT EXISTS {} (
+            r#"CREATE TABLE IF NOT EXISTS {table} (
                 id TEXT NOT NULL PRIMARY KEY,
                 next_run_time TEXT,
                 job_state TEXT NOT NULL,
                 trigger_type TEXT NOT NULL,
                 executor TEXT NOT NULL DEFAULT 'default',
-                paused INTEGER NOT NULL DEFAULT 0,
+                paused {paused_type} NOT NULL DEFAULT {paused_default},
                 acquired_by TEXT,
                 acquired_at TEXT,
                 lease_expires_at TEXT,
@@ -63,14 +116,24 @@ impl SqlJobStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )"#,
-            self.table_name
+            table = self.table_name,
+            paused_type = paused_type,
+            paused_default = paused_default,
         );
 
+        // Partial indexes: Postgres supports WHERE clauses on indexes.
+        // SQLite also supports partial indexes.
+        let paused_cond = match self.backend {
+            DbBackend::Sqlite => "paused = 0",
+            DbBackend::Postgres => "paused = FALSE",
+        };
+
         let create_index = format!(
-            r#"CREATE INDEX IF NOT EXISTS idx_{}_next_run_time
-                ON {} (next_run_time)
-                WHERE next_run_time IS NOT NULL AND paused = 0"#,
-            self.table_name, self.table_name
+            r#"CREATE INDEX IF NOT EXISTS idx_{table}_next_run_time
+                ON {table} (next_run_time)
+                WHERE next_run_time IS NOT NULL AND {paused_cond}"#,
+            table = self.table_name,
+            paused_cond = paused_cond,
         );
 
         sqlx::query(&create_table)
@@ -122,27 +185,57 @@ impl SqlJobStore {
     }
 
     /// Parse a ScheduleSpec from a database row.
-    fn row_to_spec(row: &SqliteRow) -> Result<ScheduleSpec, StoreError> {
-        let job_state: String = row.get("job_state");
+    fn row_to_spec(row: &AnyRow, backend: DbBackend) -> Result<ScheduleSpec, StoreError> {
+        let job_state: String = row
+            .try_get("job_state")
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
         let mut spec = Self::deserialize_spec(&job_state)?;
 
         // Overlay database-authoritative fields onto the deserialized spec
-        let next_run_time_str: Option<String> = row.get("next_run_time");
+        let next_run_time_str: Option<String> = row
+            .try_get("next_run_time")
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
         spec.next_run_time = match next_run_time_str {
             Some(s) => Some(Self::string_to_dt(&s)?),
             None => None,
         };
 
-        let paused: i32 = row.get("paused");
-        spec.paused = paused != 0;
+        // Read paused field - Postgres stores BOOLEAN, SQLite stores INTEGER
+        let paused: bool = match backend {
+            DbBackend::Sqlite => {
+                let val: i32 = row
+                    .try_get("paused")
+                    .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+                val != 0
+            }
+            DbBackend::Postgres => row
+                .try_get("paused")
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?,
+        };
+        spec.paused = paused;
 
-        let version: i64 = row.get("version");
+        let version: i64 = row
+            .try_get("version")
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
         spec.version = version as u64;
 
-        let executor: String = row.get("executor");
+        let executor: String = row
+            .try_get("executor")
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
         spec.executor = executor;
 
         Ok(spec)
+    }
+
+    /// Build the paused value for bind parameters.
+    /// SQLite expects i32, Postgres expects bool. With AnyPool we bind as i32
+    /// for SQLite and bool for Postgres — but AnyPool requires a uniform type.
+    /// We use a helper that returns the right SQL literal or bind approach.
+    fn paused_false_condition(&self) -> &'static str {
+        match self.backend {
+            DbBackend::Sqlite => "paused = 0",
+            DbBackend::Postgres => "paused = FALSE",
+        }
     }
 }
 
@@ -154,13 +247,32 @@ impl JobStore for SqlJobStore {
         let job_state = Self::serialize_spec(&schedule)?;
         let trigger_type = Self::trigger_type(&schedule);
         let next_run_time_str = schedule.next_run_time.as_ref().map(Self::dt_to_string);
-        let paused: i32 = if schedule.paused { 1 } else { 0 };
 
-        let query = format!(
-            r#"INSERT INTO {} (id, next_run_time, job_state, trigger_type, executor, paused, version, running_count, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)"#,
-            self.table_name
-        );
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+        let p3 = self.placeholder(3);
+        let p4 = self.placeholder(4);
+        let p5 = self.placeholder(5);
+        let p6 = self.placeholder(6);
+        let p7 = self.placeholder(7);
+        let p8 = self.placeholder(8);
+        let p9 = self.placeholder(9);
+
+        // For paused, use integer in query for both backends (Postgres will cast)
+        let paused_val: i32 = if schedule.paused { 1 } else { 0 };
+
+        let query = match self.backend {
+            DbBackend::Sqlite => format!(
+                r#"INSERT INTO {table} (id, next_run_time, job_state, trigger_type, executor, paused, version, running_count, created_at, updated_at)
+                   VALUES ({p1}, {p2}, {p3}, {p4}, {p5}, {p6}, {p7}, 0, {p8}, {p9})"#,
+                table = self.table_name,
+            ),
+            DbBackend::Postgres => format!(
+                r#"INSERT INTO {table} (id, next_run_time, job_state, trigger_type, executor, paused, version, running_count, created_at, updated_at)
+                   VALUES ({p1}, {p2}, {p3}, {p4}, {p5}, {p6}::integer != 0, {p7}, 0, {p8}, {p9})"#,
+                table = self.table_name,
+            ),
+        };
 
         sqlx::query(&query)
             .bind(&schedule.id)
@@ -168,19 +280,20 @@ impl JobStore for SqlJobStore {
             .bind(&job_state)
             .bind(trigger_type)
             .bind(&schedule.executor)
-            .bind(paused)
+            .bind(paused_val)
             .bind(schedule.version as i64)
             .bind(&now_str)
             .bind(&now_str)
             .execute(&self.pool)
             .await
             .map_err(|e| {
-                if e.to_string().contains("UNIQUE") {
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") || msg.contains("duplicate key") {
                     StoreError::DuplicateJob {
                         job_id: schedule.id.clone(),
                     }
                 } else {
-                    StoreError::QueryFailed(e.to_string())
+                    StoreError::QueryFailed(msg)
                 }
             })?;
 
@@ -193,12 +306,25 @@ impl JobStore for SqlJobStore {
         let job_state = Self::serialize_spec(&schedule)?;
         let trigger_type = Self::trigger_type(&schedule);
         let next_run_time_str = schedule.next_run_time.as_ref().map(Self::dt_to_string);
-        let paused: i32 = if schedule.paused { 1 } else { 0 };
+        let paused_val: i32 = if schedule.paused { 1 } else { 0 };
+
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+        let p3 = self.placeholder(3);
+        let p4 = self.placeholder(4);
+        let p5 = self.placeholder(5);
+        let p6 = self.placeholder(6);
+        let p7 = self.placeholder(7);
+
+        let paused_expr = match self.backend {
+            DbBackend::Sqlite => format!("paused = {p5}"),
+            DbBackend::Postgres => format!("paused = {p5}::integer != 0"),
+        };
 
         let query = format!(
-            r#"UPDATE {} SET next_run_time = ?, job_state = ?, trigger_type = ?, executor = ?, paused = ?, version = version + 1, updated_at = ?
-               WHERE id = ?"#,
-            self.table_name
+            r#"UPDATE {table} SET next_run_time = {p1}, job_state = {p2}, trigger_type = {p3}, executor = {p4}, {paused_expr}, version = version + 1, updated_at = {p6}
+               WHERE id = {p7}"#,
+            table = self.table_name,
         );
 
         let result = sqlx::query(&query)
@@ -206,7 +332,7 @@ impl JobStore for SqlJobStore {
             .bind(&job_state)
             .bind(trigger_type)
             .bind(&schedule.executor)
-            .bind(paused)
+            .bind(paused_val)
             .bind(&now_str)
             .bind(&schedule.id)
             .execute(&self.pool)
@@ -223,7 +349,8 @@ impl JobStore for SqlJobStore {
     }
 
     async fn remove_job(&self, job_id: &str) -> Result<(), StoreError> {
-        let query = format!("DELETE FROM {} WHERE id = ?", self.table_name);
+        let p1 = self.placeholder(1);
+        let query = format!("DELETE FROM {} WHERE id = {}", self.table_name, p1);
 
         let result = sqlx::query(&query)
             .bind(job_id)
@@ -252,7 +379,8 @@ impl JobStore for SqlJobStore {
     }
 
     async fn get_job(&self, job_id: &str) -> Result<ScheduleSpec, StoreError> {
-        let query = format!("SELECT * FROM {} WHERE id = ?", self.table_name);
+        let p1 = self.placeholder(1);
+        let query = format!("SELECT * FROM {} WHERE id = {}", self.table_name, p1);
 
         let row = sqlx::query(&query)
             .bind(job_id)
@@ -261,7 +389,7 @@ impl JobStore for SqlJobStore {
             .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
         match row {
-            Some(row) => Self::row_to_spec(&row),
+            Some(row) => Self::row_to_spec(&row, self.backend),
             None => Err(StoreError::JobNotFound {
                 job_id: job_id.to_string(),
             }),
@@ -276,18 +404,22 @@ impl JobStore for SqlJobStore {
             .await
             .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
-        rows.iter().map(Self::row_to_spec).collect()
+        let backend = self.backend;
+        rows.iter().map(|r| Self::row_to_spec(r, backend)).collect()
     }
 
     async fn get_due_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ScheduleSpec>, StoreError> {
         let now_str = Self::dt_to_string(&now);
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+        let paused_cond = self.paused_false_condition();
 
         let query = format!(
-            r#"SELECT * FROM {}
-               WHERE next_run_time <= ? AND paused = 0
-               AND (acquired_by IS NULL OR lease_expires_at < ?)
+            r#"SELECT * FROM {table}
+               WHERE next_run_time <= {p1} AND {paused_cond}
+               AND (acquired_by IS NULL OR lease_expires_at < {p2})
                ORDER BY next_run_time"#,
-            self.table_name
+            table = self.table_name,
         );
 
         let rows = sqlx::query(&query)
@@ -297,23 +429,28 @@ impl JobStore for SqlJobStore {
             .await
             .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
-        rows.iter().map(Self::row_to_spec).collect()
+        let backend = self.backend;
+        rows.iter().map(|r| Self::row_to_spec(r, backend)).collect()
     }
 
     async fn get_next_run_time(&self) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let paused_cond = self.paused_false_condition();
+
         let query = format!(
-            "SELECT next_run_time FROM {} WHERE next_run_time IS NOT NULL AND paused = 0 ORDER BY next_run_time LIMIT 1",
-            self.table_name
+            "SELECT next_run_time FROM {} WHERE next_run_time IS NOT NULL AND {} ORDER BY next_run_time LIMIT 1",
+            self.table_name, paused_cond,
         );
 
-        let row: Option<SqliteRow> = sqlx::query(&query)
+        let row: Option<AnyRow> = sqlx::query(&query)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
         match row {
             Some(row) => {
-                let nrt_str: String = row.get("next_run_time");
+                let nrt_str: String = row
+                    .try_get("next_run_time")
+                    .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
                 let dt = Self::string_to_dt(&nrt_str)?;
                 Ok(Some(dt))
             }
@@ -331,70 +468,42 @@ impl JobStore for SqlJobStore {
         let lease_expires = now + chrono::Duration::seconds(DEFAULT_LEASE_DURATION_SECS);
         let lease_expires_str = Self::dt_to_string(&lease_expires);
 
-        // First, get due jobs that are available for acquisition
-        let select_query = format!(
-            r#"SELECT id, version FROM {}
-               WHERE next_run_time <= ? AND paused = 0
-               AND (acquired_by IS NULL OR lease_expires_at < ?)
-               ORDER BY next_run_time
-               LIMIT ?"#,
-            self.table_name
-        );
-
-        let candidates = sqlx::query(&select_query)
-            .bind(&now_str)
-            .bind(&now_str)
-            .bind(max_jobs as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
-
-        let mut leases = Vec::new();
-
-        // Try to acquire each candidate with optimistic locking
-        let update_query = format!(
-            r#"UPDATE {} SET acquired_by = ?, acquired_at = ?, lease_expires_at = ?, version = version + 1
-               WHERE id = ? AND version = ? AND (acquired_by IS NULL OR lease_expires_at < ?)"#,
-            self.table_name
-        );
-
-        for candidate in &candidates {
-            let job_id: String = candidate.get("id");
-            let version: i64 = candidate.get("version");
-
-            let result = sqlx::query(&update_query)
-                .bind(scheduler_id)
-                .bind(&now_str)
-                .bind(&lease_expires_str)
-                .bind(&job_id)
-                .bind(version)
-                .bind(&now_str)
-                .execute(&self.pool)
+        match self.backend {
+            DbBackend::Postgres => {
+                self.acquire_jobs_postgres(
+                    scheduler_id,
+                    max_jobs,
+                    &now_str,
+                    &lease_expires_str,
+                    now,
+                    lease_expires,
+                )
                 .await
-                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
-
-            if result.rows_affected() > 0 {
-                leases.push(JobLease {
-                    job_id,
-                    scheduler_id: scheduler_id.to_string(),
-                    acquired_at: now,
-                    expires_at: lease_expires,
-                    version: (version + 1) as u64,
-                });
             }
-            // If rows_affected == 0, another worker acquired it first; skip silently
+            DbBackend::Sqlite => {
+                self.acquire_jobs_sqlite(
+                    scheduler_id,
+                    max_jobs,
+                    &now_str,
+                    &lease_expires_str,
+                    now,
+                    lease_expires,
+                )
+                .await
+            }
         }
-
-        Ok(leases)
     }
 
     async fn release_job(&self, job_id: &str, scheduler_id: &str) -> Result<(), StoreError> {
         let now_str = Self::dt_to_string(&Utc::now());
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+        let p3 = self.placeholder(3);
 
         let query = format!(
-            r#"UPDATE {} SET acquired_by = NULL, acquired_at = NULL, lease_expires_at = NULL, updated_at = ?
-               WHERE id = ? AND acquired_by = ?"#,
-            self.table_name
+            r#"UPDATE {table} SET acquired_by = NULL, acquired_at = NULL, lease_expires_at = NULL, updated_at = {p1}
+               WHERE id = {p2} AND acquired_by = {p3}"#,
+            table = self.table_name,
         );
 
         let result = sqlx::query(&query)
@@ -421,10 +530,13 @@ impl JobStore for SqlJobStore {
     ) -> Result<(), StoreError> {
         let now_str = Self::dt_to_string(&Utc::now());
         let next_str = next.as_ref().map(Self::dt_to_string);
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+        let p3 = self.placeholder(3);
 
         let query = format!(
-            "UPDATE {} SET next_run_time = ?, updated_at = ? WHERE id = ?",
-            self.table_name
+            "UPDATE {table} SET next_run_time = {p1}, updated_at = {p2} WHERE id = {p3}",
+            table = self.table_name,
         );
 
         let result = sqlx::query(&query)
@@ -446,10 +558,12 @@ impl JobStore for SqlJobStore {
 
     async fn increment_running_count(&self, job_id: &str) -> Result<u32, StoreError> {
         let now_str = Self::dt_to_string(&Utc::now());
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
 
         let query = format!(
-            "UPDATE {} SET running_count = running_count + 1, updated_at = ? WHERE id = ?",
-            self.table_name
+            "UPDATE {table} SET running_count = running_count + 1, updated_at = {p1} WHERE id = {p2}",
+            table = self.table_name,
         );
 
         let result = sqlx::query(&query)
@@ -470,10 +584,12 @@ impl JobStore for SqlJobStore {
 
     async fn decrement_running_count(&self, job_id: &str) -> Result<u32, StoreError> {
         let now_str = Self::dt_to_string(&Utc::now());
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
 
         let query = format!(
-            "UPDATE {} SET running_count = MAX(running_count - 1, 0), updated_at = ? WHERE id = ?",
-            self.table_name
+            "UPDATE {table} SET running_count = CASE WHEN running_count > 0 THEN running_count - 1 ELSE 0 END, updated_at = {p1} WHERE id = {p2}",
+            table = self.table_name,
         );
 
         let result = sqlx::query(&query)
@@ -493,9 +609,13 @@ impl JobStore for SqlJobStore {
     }
 
     async fn get_running_count(&self, job_id: &str) -> Result<u32, StoreError> {
-        let query = format!("SELECT running_count FROM {} WHERE id = ?", self.table_name);
+        let p1 = self.placeholder(1);
+        let query = format!(
+            "SELECT running_count FROM {} WHERE id = {}",
+            self.table_name, p1
+        );
 
-        let row: Option<SqliteRow> = sqlx::query(&query)
+        let row: Option<AnyRow> = sqlx::query(&query)
             .bind(job_id)
             .fetch_optional(&self.pool)
             .await
@@ -503,13 +623,158 @@ impl JobStore for SqlJobStore {
 
         match row {
             Some(row) => {
-                let count: i32 = row.get("running_count");
+                let count: i32 = row
+                    .try_get("running_count")
+                    .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
                 Ok(count as u32)
             }
             None => Err(StoreError::JobNotFound {
                 job_id: job_id.to_string(),
             }),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend-specific acquire_jobs implementations
+// ---------------------------------------------------------------------------
+
+impl SqlJobStore {
+    /// PostgreSQL acquire: uses `FOR UPDATE SKIP LOCKED` for lock-free
+    /// distributed job acquisition. This is the killer feature -- multiple
+    /// scheduler instances will never deadlock or double-execute jobs.
+    async fn acquire_jobs_postgres(
+        &self,
+        scheduler_id: &str,
+        max_jobs: usize,
+        now_str: &str,
+        lease_expires_str: &str,
+        now: DateTime<Utc>,
+        lease_expires: DateTime<Utc>,
+    ) -> Result<Vec<JobLease>, StoreError> {
+        // Single atomic query: SELECT ... FOR UPDATE SKIP LOCKED, then UPDATE
+        // We use a CTE (Common Table Expression) to atomically select and update.
+        let query = format!(
+            r#"WITH candidates AS (
+                SELECT id, version FROM {table}
+                WHERE next_run_time <= $1
+                  AND paused = FALSE
+                  AND (acquired_by IS NULL OR lease_expires_at < $2)
+                ORDER BY next_run_time
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {table} SET
+                acquired_by = $4,
+                acquired_at = $5,
+                lease_expires_at = $6,
+                version = {table}.version + 1
+            FROM candidates
+            WHERE {table}.id = candidates.id
+            RETURNING {table}.id, candidates.version + 1 AS new_version"#,
+            table = self.table_name,
+        );
+
+        let rows = sqlx::query(&query)
+            .bind(now_str)
+            .bind(now_str)
+            .bind(max_jobs as i64)
+            .bind(scheduler_id)
+            .bind(now_str)
+            .bind(lease_expires_str)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+        let mut leases = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let job_id: String = row
+                .try_get("id")
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+            let new_version: i64 = row
+                .try_get("new_version")
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+            leases.push(JobLease {
+                job_id,
+                scheduler_id: scheduler_id.to_string(),
+                acquired_at: now,
+                expires_at: lease_expires,
+                version: new_version as u64,
+            });
+        }
+
+        Ok(leases)
+    }
+
+    /// SQLite acquire: uses optimistic locking (SELECT then UPDATE with version check).
+    async fn acquire_jobs_sqlite(
+        &self,
+        scheduler_id: &str,
+        max_jobs: usize,
+        now_str: &str,
+        lease_expires_str: &str,
+        now: DateTime<Utc>,
+        lease_expires: DateTime<Utc>,
+    ) -> Result<Vec<JobLease>, StoreError> {
+        // First, get due jobs that are available for acquisition
+        let select_query = format!(
+            r#"SELECT id, version FROM {table}
+               WHERE next_run_time <= ? AND paused = 0
+               AND (acquired_by IS NULL OR lease_expires_at < ?)
+               ORDER BY next_run_time
+               LIMIT ?"#,
+            table = self.table_name,
+        );
+
+        let candidates = sqlx::query(&select_query)
+            .bind(now_str)
+            .bind(now_str)
+            .bind(max_jobs as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+        let mut leases = Vec::new();
+
+        // Try to acquire each candidate with optimistic locking
+        let update_query = format!(
+            r#"UPDATE {table} SET acquired_by = ?, acquired_at = ?, lease_expires_at = ?, version = version + 1
+               WHERE id = ? AND version = ? AND (acquired_by IS NULL OR lease_expires_at < ?)"#,
+            table = self.table_name,
+        );
+
+        for candidate in &candidates {
+            let job_id: String = candidate
+                .try_get("id")
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+            let version: i64 = candidate
+                .try_get("version")
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+            let result = sqlx::query(&update_query)
+                .bind(scheduler_id)
+                .bind(now_str)
+                .bind(lease_expires_str)
+                .bind(&job_id)
+                .bind(version)
+                .bind(now_str)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+            if result.rows_affected() > 0 {
+                leases.push(JobLease {
+                    job_id,
+                    scheduler_id: scheduler_id.to_string(),
+                    acquired_at: now,
+                    expires_at: lease_expires,
+                    version: (version + 1) as u64,
+                });
+            }
+            // If rows_affected == 0, another worker acquired it first; skip silently
+        }
+
+        Ok(leases)
     }
 }
 
@@ -931,5 +1196,36 @@ mod tests {
             }
             _ => panic!("expected interval trigger"),
         }
+    }
+
+    // ---- Backend detection tests ----
+
+    #[test]
+    fn test_detect_backend_sqlite() {
+        assert_eq!(
+            SqlJobStore::detect_backend("sqlite::memory:").unwrap(),
+            DbBackend::Sqlite
+        );
+        assert_eq!(
+            SqlJobStore::detect_backend("sqlite://test.db").unwrap(),
+            DbBackend::Sqlite
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_postgres() {
+        assert_eq!(
+            SqlJobStore::detect_backend("postgres://localhost/test").unwrap(),
+            DbBackend::Postgres
+        );
+        assert_eq!(
+            SqlJobStore::detect_backend("postgresql://user:pass@localhost/db").unwrap(),
+            DbBackend::Postgres
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_unsupported() {
+        assert!(SqlJobStore::detect_backend("mysql://localhost/test").is_err());
     }
 }

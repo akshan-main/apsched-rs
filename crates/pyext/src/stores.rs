@@ -30,6 +30,9 @@ impl PyMemoryJobStore {
 /// Configuration for a SQL job store that will be created lazily.
 /// The actual SqlJobStore must be created within the scheduler's tokio runtime
 /// to avoid runtime-binding issues with sqlx connection pools.
+///
+/// Supports both SQLite and PostgreSQL URLs. The backend is auto-detected
+/// from the URL prefix (`sqlite:`, `postgres:`, `postgresql:`).
 #[pyclass(name = "SqlJobStore")]
 pub struct PySqlJobStore {
     pub(crate) url: String,
@@ -59,6 +62,40 @@ impl PySqlJobStore {
         format!(
             "SqlJobStore(url={:?}, tablename={:?})",
             self.url, self.tablename
+        )
+    }
+}
+
+/// Configuration for a Redis job store that will be created lazily.
+/// The actual RedisJobStore must be created within the scheduler's tokio runtime.
+#[pyclass(name = "RedisJobStore")]
+pub struct PyRedisJobStore {
+    pub(crate) url: String,
+    pub(crate) prefix: String,
+}
+
+#[pymethods]
+impl PyRedisJobStore {
+    #[new]
+    #[pyo3(signature = (url, prefix=None))]
+    fn new(url: &str, prefix: Option<&str>) -> PyResult<Self> {
+        Ok(Self {
+            url: url.to_string(),
+            prefix: prefix.unwrap_or("apscheduler:").to_string(),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RedisJobStore(url={:?}, prefix={:?})",
+            self.url, self.prefix
+        )
+    }
+
+    fn __str__(&self) -> String {
+        format!(
+            "RedisJobStore(url={:?}, prefix={:?})",
+            self.url, self.prefix
         )
     }
 }

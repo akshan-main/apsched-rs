@@ -1,0 +1,45 @@
+scheduler:
+  timezone: "UTC"
+  misfire_grace_time: 60
+  coalesce: true
+
+store:
+  type: memory
+
+api:
+  enabled: true
+  bind: "0.0.0.0:8080"
+
+jobs:
+  - id: echo_test
+    name: "Echo Test"
+    trigger:
+      type: interval
+      seconds: 60
+    action:
+      type: shell
+      command: "echo 'Hello from apscheduler-daemon!'"
+      timeout: 10
+
+  - id: health_check
+    name: "Health Check"
+    trigger:
+      type: interval
+      seconds: 30
+    action:
+      type: http
+      url: "https://httpbin.org/get"
+      method: GET
+      timeout: 10
+
+  - id: cleanup
+    name: "Weekly Cleanup"
+    trigger:
+      type: cron
+      day_of_week: "sun"
+      hour: "3"
+      minute: "0"
+    action:
+      type: shell
+      command: "echo 'Running weekly cleanup'"
+    misfire_grace_time: 3600
