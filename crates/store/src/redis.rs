@@ -456,7 +456,7 @@ impl JobStore for RedisJobStore {
                     .await
                     .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
-                if let Some(_) = acquired_by {
+                if acquired_by.is_some() {
                     let expires: Option<String> =
                         conn.hget(&lease_key, "lease_expires_at")
                             .await
@@ -487,9 +487,9 @@ impl JobStore for RedisJobStore {
             .await
             .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
-        if let Some((_job_id, _score)) = result.first() {
+        if let Some((job_id, _score)) = result.first() {
             // Read the actual next_run_time from the job hash for precision
-            if let Some(spec) = self.read_job(&_job_id).await? {
+            if let Some(spec) = self.read_job(job_id).await? {
                 return Ok(spec.next_run_time);
             }
         }
@@ -745,6 +745,41 @@ impl JobStore for RedisJobStore {
             .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
 
         Ok(count.unwrap_or(0) as u32)
+    }
+
+    async fn cleanup_stale_leases(&self, now: DateTime<Utc>) -> Result<u32, StoreError> {
+        let mut conn = self.connection.clone();
+        let now_str = now.to_rfc3339();
+        let index_key = self.index_key();
+
+        // Get all job IDs from the index set
+        let job_ids: Vec<String> = conn
+            .smembers(&index_key)
+            .await
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+        let mut cleaned = 0u32;
+        for job_id in &job_ids {
+            let lease_key = self.lease_key(job_id);
+
+            let expires: Option<String> = conn
+                .hget(&lease_key, "lease_expires_at")
+                .await
+                .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+            if let Some(expires_str) = expires {
+                if expires_str < now_str {
+                    // Lease is stale, remove it
+                    let _: () = conn
+                        .del(&lease_key)
+                        .await
+                        .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+                    cleaned += 1;
+                }
+            }
+        }
+
+        Ok(cleaned)
     }
 }
 

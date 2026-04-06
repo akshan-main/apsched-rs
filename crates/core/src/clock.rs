@@ -66,13 +66,13 @@ impl TestClock {
             .unwrap_or_else(|_| chrono::Duration::milliseconds(duration.as_millis() as i64));
 
         let mut time = self.current_time.lock().unwrap();
-        *time = *time + chrono_dur;
+        *time += chrono_dur;
 
         let mut offset = self.monotonic_offset.lock().unwrap();
         *offset += duration;
 
         let mut wall_off = self.wall_offset.lock().unwrap();
-        *wall_off = *wall_off + chrono_dur;
+        *wall_off += chrono_dur;
     }
 
     /// Jump to a specific time. Also adjusts the monotonic offset accordingly.

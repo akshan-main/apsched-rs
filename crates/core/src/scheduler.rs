@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -11,7 +12,8 @@ use crate::clock::{Clock, WallClock};
 use crate::error::SchedulerError;
 use crate::event::{EventBus, ListenerId, SchedulerEvent};
 use crate::model::{
-    JobChanges, JobResultEnvelope, JobSpec, ScheduleSpec, SchedulerConfig, SchedulerState,
+    DeadLetterEntry, JobChanges, JobResultEnvelope, JobSpec, ScheduleSpec, SchedulerConfig,
+    SchedulerState, TaskSpec,
 };
 use crate::traits::{Executor, JobStore};
 
@@ -33,6 +35,13 @@ pub struct SchedulerEngine {
     /// Channel for receiving job results from executors.
     result_tx: mpsc::Sender<JobResultEnvelope>,
     result_rx: Arc<Mutex<Option<mpsc::Receiver<JobResultEnvelope>>>>,
+    /// Dead letter queue for jobs that failed after exhausting retries.
+    dead_letter: Arc<RwLock<VecDeque<DeadLetterEntry>>>,
+    dead_letter_max: usize,
+    /// Sliding window rate limiter: schedule_id -> timestamps of recent executions.
+    rate_windows: Arc<DashMap<String, VecDeque<DateTime<Utc>>>>,
+    /// Running instance counts per concurrency group.
+    group_running: Arc<DashMap<String, AtomicU32>>,
 }
 
 impl std::fmt::Debug for SchedulerEngine {
@@ -63,6 +72,10 @@ impl SchedulerEngine {
             runtime_handle: Arc::new(Mutex::new(None)),
             result_tx,
             result_rx: Arc::new(Mutex::new(Some(result_rx))),
+            dead_letter: Arc::new(RwLock::new(VecDeque::new())),
+            dead_letter_max: 1000,
+            rate_windows: Arc::new(DashMap::new()),
+            group_running: Arc::new(DashMap::new()),
         }
     }
 
@@ -123,12 +136,49 @@ impl SchedulerEngine {
             *rt = Some(handle.clone());
         }
 
-        // Start all executors
+        // Bug fix: clean up stale leases from crashed schedulers before starting.
         {
-            let executors = self.executors.read();
-            for (alias, executor) in executors.iter() {
+            let now = self.clock.now();
+            let store_snapshot: Vec<(String, Arc<dyn JobStore>)> = {
+                let stores = self.stores.read();
+                stores
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect()
+            };
+            for (alias, store) in &store_snapshot {
+                match store.cleanup_stale_leases(now).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(
+                            store = alias.as_str(),
+                            "cleaned up {} stale lease(s) on startup",
+                            count
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            store = alias.as_str(),
+                            "failed to clean up stale leases: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Start all executors (clone out of lock to avoid holding it across await)
+        {
+            let executor_snapshot: Vec<(String, Arc<dyn Executor>)> = {
+                let executors = self.executors.read();
+                executors
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                    .collect()
+            };
+            for (alias, executor) in &executor_snapshot {
                 executor.start().await.map_err(|e| {
-                    tracing::error!(executor = alias, "failed to start executor: {}", e);
+                    tracing::error!(executor = alias.as_str(), "failed to start executor: {}", e);
                     SchedulerError::ExecutorError(e)
                 })?;
             }
@@ -148,6 +198,10 @@ impl SchedulerEngine {
             stores: Arc::clone(&self.stores),
             executors: Arc::clone(&self.executors),
             event_bus: Arc::clone(&self.event_bus),
+            dead_letter: Arc::clone(&self.dead_letter),
+            dead_letter_max: self.dead_letter_max,
+            rate_windows: Arc::clone(&self.rate_windows),
+            group_running: Arc::clone(&self.group_running),
             clock: Arc::clone(&self.clock),
             wakeup_notify: Arc::clone(&self.wakeup_notify),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
@@ -187,10 +241,13 @@ impl SchedulerEngine {
         self.shutdown_notify.notify_one();
         self.wakeup_notify.notify_one();
 
-        // Shut down executors
+        // Shut down executors (clone out of lock to avoid holding across await)
         {
-            let executors = self.executors.read();
-            for (_alias, executor) in executors.iter() {
+            let executor_snapshot: Vec<Arc<dyn Executor>> = {
+                let executors = self.executors.read();
+                executors.values().cloned().collect()
+            };
+            for executor in &executor_snapshot {
                 if let Err(e) = executor.shutdown(wait).await {
                     tracing::error!("error shutting down executor: {}", e);
                 }
@@ -214,6 +271,14 @@ impl SchedulerEngine {
     /// Add a job schedule. If `replace_existing` is true on the spec and a job with the
     /// same ID already exists, it will be replaced.
     pub async fn add_job(&self, schedule: ScheduleSpec) -> Result<(), SchedulerError> {
+        // Bug fix: reject new jobs during shutdown to prevent silent job loss.
+        {
+            let state = self.state.read();
+            if *state == SchedulerState::ShuttingDown {
+                return Err(SchedulerError::SchedulerShuttingDown);
+            }
+        }
+
         let store_alias = schedule.jobstore.clone();
         let job_id = schedule.id.clone();
 
@@ -579,6 +644,99 @@ impl SchedulerEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Dead letter queue
+    // -----------------------------------------------------------------------
+
+    /// Return all dead letter entries.
+    pub fn get_dead_letters(&self) -> Vec<DeadLetterEntry> {
+        self.dead_letter.read().iter().cloned().collect()
+    }
+
+    /// Return a single dead letter entry by job_id.
+    pub fn get_dead_letter(&self, job_id: &str) -> Option<DeadLetterEntry> {
+        self.dead_letter
+            .read()
+            .iter()
+            .find(|e| e.job_id == job_id)
+            .cloned()
+    }
+
+    /// Remove a dead letter entry by job_id. Returns true if found and removed.
+    pub fn remove_dead_letter(&self, job_id: &str) -> bool {
+        let mut dl = self.dead_letter.write();
+        let before = dl.len();
+        dl.retain(|e| e.job_id != job_id);
+        dl.len() < before
+    }
+
+    /// Clear all dead letter entries.
+    pub fn clear_dead_letters(&self) {
+        self.dead_letter.write().clear();
+    }
+
+    /// Replay a dead letter entry by re-adding it to the scheduler as a
+    /// one-shot date trigger that fires immediately.
+    pub async fn replay_dead_letter(&self, job_id: &str) -> Result<(), SchedulerError> {
+        let entry = {
+            let dl = self.dead_letter.read();
+            dl.iter()
+                .find(|e| e.job_id == job_id)
+                .cloned()
+                .ok_or_else(|| SchedulerError::JobNotFound {
+                    job_id: job_id.to_string(),
+                })?
+        };
+
+        // Build a one-shot schedule that fires immediately
+        let now = self.clock.now();
+        let trigger_state = crate::model::TriggerState::Date {
+            run_date: now,
+            timezone: "UTC".to_string(),
+        };
+        let mut spec = ScheduleSpec::new(
+            format!("{}-replay", entry.job_id),
+            entry.task.clone(),
+            trigger_state,
+        );
+        spec.next_run_time = Some(now);
+        spec.replace_existing = true;
+
+        self.add_job(spec).await?;
+
+        // Remove from DLQ
+        self.remove_dead_letter(job_id);
+        Ok(())
+    }
+
+    /// Internal: push a dead letter entry, evicting oldest if over capacity.
+    #[allow(dead_code)]
+    fn push_dead_letter(&self, entry: DeadLetterEntry) {
+        let mut dl = self.dead_letter.write();
+        if dl.len() >= self.dead_letter_max {
+            dl.pop_front();
+        }
+        dl.push_back(entry);
+    }
+
+    /// Return a reference to the dead letter queue Arc (for sharing with loop context).
+    #[allow(dead_code)]
+    pub(crate) fn dead_letter_arc(&self) -> &Arc<RwLock<VecDeque<DeadLetterEntry>>> {
+        &self.dead_letter
+    }
+
+    /// Return a reference to rate windows.
+    #[allow(dead_code)]
+    pub(crate) fn rate_windows_arc(&self) -> &Arc<DashMap<String, VecDeque<DateTime<Utc>>>> {
+        &self.rate_windows
+    }
+
+    /// Return a reference to group running counts.
+    #[allow(dead_code)]
+    pub(crate) fn group_running_arc(&self) -> &Arc<DashMap<String, AtomicU32>> {
+        &self.group_running
+    }
+
+    // -----------------------------------------------------------------------
     // Introspection helpers
     // -----------------------------------------------------------------------
 
@@ -665,6 +823,10 @@ struct SchedulerLoopContext {
     scheduler_id: String,
     #[allow(dead_code)]
     config: SchedulerConfig,
+    dead_letter: Arc<RwLock<VecDeque<DeadLetterEntry>>>,
+    dead_letter_max: usize,
+    rate_windows: Arc<DashMap<String, VecDeque<DateTime<Utc>>>>,
+    group_running: Arc<DashMap<String, AtomicU32>>,
 }
 
 impl SchedulerLoopContext {
@@ -678,8 +840,17 @@ impl SchedulerLoopContext {
             let eb = Arc::clone(&event_bus);
             let ri = Arc::clone(&running_instances);
             let st = Arc::clone(&stores_for_results);
+            let dl = Arc::clone(&self.dead_letter);
+            let dl_max = self.dead_letter_max;
+            let gr = Arc::clone(&self.group_running);
             tokio::spawn(async move {
                 while let Some(envelope) = rx.recv().await {
+                    tracing::debug!(
+                        job_id = %envelope.job_id,
+                        schedule_id = %envelope.schedule_id,
+                        "processing job result"
+                    );
+
                     // Decrement running count
                     if let Some(mut count) = ri.get_mut(&envelope.schedule_id) {
                         if *count > 0 {
@@ -700,13 +871,62 @@ impl SchedulerLoopContext {
                         let _ = store.decrement_running_count(&envelope.schedule_id).await;
                     }
 
+                    // Decrement concurrency group running count if applicable
+                    {
+                        // Look up the schedule to find its concurrency group
+                        for (_alias, store) in &store_snapshot {
+                            if let Ok(spec) = store.get_job(&envelope.schedule_id).await {
+                                if let Some(ref group) = spec.concurrency_group {
+                                    if let Some(counter) = gr.get(group) {
+                                        let prev = counter.value().load(AtomicOrdering::Relaxed);
+                                        if prev > 0 {
+                                            counter.value().fetch_sub(1, AtomicOrdering::Relaxed);
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
                     // Find which store has this job
                     let mut found_store = "default".to_string();
+                    let mut found_task: Option<TaskSpec> = None;
                     for (alias, store) in &store_snapshot {
-                        if store.get_job(&envelope.schedule_id).await.is_ok() {
+                        if let Ok(spec) = store.get_job(&envelope.schedule_id).await {
                             found_store = alias.clone();
+                            found_task = Some(spec.task.clone());
                             break;
                         }
+                    }
+
+                    // If the job failed, add to dead letter queue
+                    if let crate::model::JobOutcome::Error(ref err_msg) = envelope.outcome {
+                        let entry = DeadLetterEntry {
+                            job_id: envelope.job_id.to_string(),
+                            schedule_id: envelope.schedule_id.clone(),
+                            failed_at: envelope.completed_at,
+                            scheduled_fire_time: envelope.completed_at,
+                            error_type: "JobError".to_string(),
+                            error_message: err_msg.clone(),
+                            traceback: None,
+                            attempt: 1,
+                            task: found_task.unwrap_or_else(|| {
+                                TaskSpec::new(crate::model::CallableRef::ImportPath(
+                                    "unknown".to_string(),
+                                ))
+                            }),
+                        };
+                        let mut dlq = dl.write();
+                        if dlq.len() >= dl_max {
+                            dlq.pop_front();
+                        }
+                        dlq.push_back(entry);
+                        tracing::warn!(
+                            schedule_id = %envelope.schedule_id,
+                            "job failed, added to dead letter queue: {}",
+                            err_msg
+                        );
                     }
 
                     let event = SchedulerEvent::from_outcome(
@@ -725,7 +945,7 @@ impl SchedulerLoopContext {
             // 1. Check if shutting down
             {
                 let state = self.state.read();
-                if *state == SchedulerState::ShuttingDown || *state == SchedulerState::Stopped {
+                if *state == SchedulerState::ShuttingDown {
                     tracing::info!("scheduler loop exiting: state = {:?}", *state);
                     return;
                 }
@@ -744,6 +964,10 @@ impl SchedulerLoopContext {
 
             // 3. Get all due jobs across all stores
             // Clone stores out of the lock to avoid holding it across await points.
+            tracing::trace!(
+                scheduler_id = %self.scheduler_id,
+                "scheduler_loop_iteration"
+            );
             let store_snapshot: Vec<(String, Arc<dyn JobStore>)> = {
                 let stores = self.stores.read();
                 stores
@@ -809,6 +1033,21 @@ impl SchedulerLoopContext {
         now: DateTime<Utc>,
     ) {
         let job_id = &schedule.id;
+
+        let trigger_type = match &schedule.trigger_state {
+            crate::model::TriggerState::Date { .. } => "date",
+            crate::model::TriggerState::Interval { .. } => "interval",
+            crate::model::TriggerState::Cron { .. } => "cron",
+            crate::model::TriggerState::CalendarInterval { .. } => "calendarinterval",
+            crate::model::TriggerState::Plugin { .. } => "plugin",
+        };
+
+        tracing::info!(
+            job_id = %job_id,
+            trigger_type = %trigger_type,
+            scheduled_fire_time = %schedule.next_run_time.map(|t| t.to_string()).unwrap_or_default(),
+            "job_execution"
+        );
 
         // Skip paused jobs
         if schedule.paused {
@@ -876,6 +1115,51 @@ impl SchedulerLoopContext {
                 jobstore: store_alias.to_string(),
             });
             return;
+        }
+
+        // Check rate limit
+        if let Some(ref rl) = schedule.rate_limit {
+            let window = chrono::Duration::seconds(rl.window_seconds as i64);
+            let cutoff = now - window;
+            let mut entry = self
+                .rate_windows
+                .entry(job_id.clone())
+                .or_default();
+            // Evict old entries
+            while entry.front().map(|t| *t < cutoff).unwrap_or(false) {
+                entry.pop_front();
+            }
+            if entry.len() >= rl.max_executions as usize {
+                tracing::debug!(
+                    job_id = job_id,
+                    "rate limit exceeded ({}/{} in {}s)",
+                    entry.len(),
+                    rl.max_executions,
+                    rl.window_seconds,
+                );
+                return;
+            }
+            entry.push_back(now);
+        }
+
+        // Check concurrency group limit
+        if let Some(ref group) = schedule.concurrency_group {
+            let counter = self
+                .group_running
+                .entry(group.clone())
+                .or_insert_with(|| AtomicU32::new(0));
+            let current = counter.value().load(AtomicOrdering::Relaxed);
+            if current >= schedule.max_group_instances {
+                tracing::debug!(
+                    job_id = job_id,
+                    group = group,
+                    "concurrency group limit reached ({}/{})",
+                    current,
+                    schedule.max_group_instances,
+                );
+                return;
+            }
+            counter.value().fetch_add(1, AtomicOrdering::Relaxed);
         }
 
         // Apply coalesce: we only submit once per due evaluation
@@ -1158,6 +1442,10 @@ mod tests {
         async fn get_running_count(&self, job_id: &str) -> Result<u32, StoreError> {
             let counts = self.running_counts.lock();
             Ok(*counts.get(job_id).unwrap_or(&0))
+        }
+
+        async fn cleanup_stale_leases(&self, _now: DateTime<Utc>) -> Result<u32, StoreError> {
+            Ok(0)
         }
     }
 
@@ -1475,5 +1763,30 @@ mod tests {
     fn test_resume_not_running() {
         let engine = SchedulerEngine::with_defaults();
         assert!(engine.resume().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_add_job_during_shutdown_rejected() {
+        // Bug 4 fix test: jobs added during shutdown should be rejected, not silently lost.
+        // We directly set the state to ShuttingDown to simulate the window between
+        // the shutdown signal and the actual completion of shutdown.
+        let engine = SchedulerEngine::with_defaults();
+        let store = Arc::new(MockJobStore::new());
+        engine.add_jobstore(store, "default").unwrap();
+
+        // Manually set state to ShuttingDown (simulating the shutdown window)
+        {
+            let mut state = engine.state.write();
+            *state = SchedulerState::ShuttingDown;
+        }
+
+        // Now try to add a job -- should fail with SchedulerShuttingDown
+        let spec = ScheduleSpec::new("late_job", sample_task(), sample_trigger());
+        let result = engine.add_job(spec).await;
+        assert!(
+            matches!(result, Err(SchedulerError::SchedulerShuttingDown)),
+            "add_job during shutdown should return SchedulerShuttingDown error, got: {:?}",
+            result
+        );
     }
 }

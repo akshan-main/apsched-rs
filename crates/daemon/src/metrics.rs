@@ -76,6 +76,7 @@ impl Metrics {
     }
 
     /// Record a missed execution.
+    #[allow(dead_code)]
     pub fn record_missed(&self) {
         self.executions_missed.fetch_add(1, Ordering::Relaxed);
     }

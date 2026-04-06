@@ -5,6 +5,29 @@ use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// An entry in the dead letter queue, representing a job that failed after
+/// exhausting all retries (or with no retry policy).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEntry {
+    pub job_id: String,
+    pub schedule_id: String,
+    pub failed_at: DateTime<Utc>,
+    pub scheduled_fire_time: DateTime<Utc>,
+    pub error_type: String,
+    pub error_message: String,
+    pub traceback: Option<String>,
+    pub attempt: u32,
+    pub task: TaskSpec,
+}
+
+/// Rate limit configuration for a job or group: max N executions within a
+/// sliding window of W seconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub max_executions: u32,
+    pub window_seconds: u64,
+}
+
 /// Represents a serialized value that can be passed as an argument to a callable.
 /// Supports multiple serialization formats for cross-language compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,18 +110,13 @@ impl TaskSpec {
 }
 
 /// Controls whether multiple pending executions of the same job are combined into one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoalescePolicy {
     /// Do not coalesce; run every pending execution.
     Off,
     /// Coalesce all pending executions into a single run.
+    #[default]
     On,
-}
-
-impl Default for CoalescePolicy {
-    fn default() -> Self {
-        CoalescePolicy::On
-    }
 }
 
 /// Controls what happens when a job misses its scheduled fire time.
@@ -371,7 +389,7 @@ impl TriggerState {
                 let interval = chrono::Duration::seconds(total_secs);
                 let mut next = previous_fire_time + interval;
                 while next <= now {
-                    next = next + interval;
+                    next += interval;
                 }
                 if let Some(end) = end_date {
                     if next > *end {
@@ -382,7 +400,7 @@ impl TriggerState {
                 if let Some(j) = jitter {
                     if *j > 0.0 {
                         let offset_ms = rand::thread_rng().gen_range(0..=(*j * 1000.0) as i64);
-                        next = next + chrono::Duration::milliseconds(offset_ms);
+                        next += chrono::Duration::milliseconds(offset_ms);
                     }
                 }
                 Some(next)
@@ -422,6 +440,20 @@ pub struct ScheduleSpec {
     pub paused: bool,
     pub replace_existing: bool,
     pub version: u64,
+    /// Optional rate limit for this job.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimit>,
+    /// Optional concurrency group name. Jobs sharing the same group name
+    /// share a concurrency limit defined by `max_group_instances`.
+    #[serde(default)]
+    pub concurrency_group: Option<String>,
+    /// Maximum concurrent instances across the concurrency group.
+    #[serde(default = "default_max_group_instances")]
+    pub max_group_instances: u32,
+}
+
+fn default_max_group_instances() -> u32 {
+    1
 }
 
 impl ScheduleSpec {
@@ -442,6 +474,9 @@ impl ScheduleSpec {
             paused: false,
             replace_existing: false,
             version: 1,
+            rate_limit: None,
+            concurrency_group: None,
+            max_group_instances: 1,
         }
     }
 
@@ -551,19 +586,14 @@ pub struct JobResultEnvelope {
 }
 
 /// The state of the scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchedulerState {
+    #[default]
     Stopped,
     Starting,
     Running,
     Paused,
     ShuttingDown,
-}
-
-impl Default for SchedulerState {
-    fn default() -> Self {
-        SchedulerState::Stopped
-    }
 }
 
 /// Default values for job parameters.

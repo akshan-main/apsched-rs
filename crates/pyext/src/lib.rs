@@ -10,6 +10,12 @@ mod scheduler;
 mod stores;
 mod triggers;
 
+#[pyfunction]
+#[pyo3(signature = (otel_endpoint=None))]
+fn init_tracing(otel_endpoint: Option<&str>) {
+    apsched_core::init_tracing(otel_endpoint);
+}
+
 #[pymodule]
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register trigger classes
@@ -37,6 +43,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register event constants and classes
     events::register_events(m)?;
+
+    // Register init_tracing function
+    m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
 
     Ok(())
 }

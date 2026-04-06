@@ -87,6 +87,13 @@ pub trait JobStore: Send + Sync + std::fmt::Debug {
 
     /// Get the current running instance count for a job.
     async fn get_running_count(&self, job_id: &str) -> Result<u32, StoreError>;
+
+    /// Clean up stale leases: release any job whose lease has expired.
+    ///
+    /// This should be called during scheduler startup to recover jobs that were
+    /// held by a scheduler that crashed or was killed without releasing its leases.
+    /// Returns the number of leases that were cleaned up.
+    async fn cleanup_stale_leases(&self, now: DateTime<Utc>) -> Result<u32, StoreError>;
 }
 
 /// Trait for job execution backends.

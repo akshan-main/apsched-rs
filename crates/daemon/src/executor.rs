@@ -13,6 +13,7 @@ use crate::metrics::Metrics;
 
 /// Outcome of executing a daemon job action.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ActionOutcome {
     pub success: bool,
     pub output: Option<String>,
@@ -79,15 +80,15 @@ pub async fn execute_action(
     }
 
     // Record history
-    history.record(
-        job_id,
+    history.record(crate::history::ExecutionRecord {
+        job_id: job_id.to_string(),
         scheduled_time,
         actual_time,
-        duration,
-        outcome_str,
-        result.error.clone(),
-        result.output.clone(),
-    );
+        duration_ms: duration.as_millis() as u64,
+        outcome: outcome_str.to_string(),
+        error_message: result.error.clone(),
+        output: result.output.clone(),
+    });
 
     debug!(
         job_id = job_id,

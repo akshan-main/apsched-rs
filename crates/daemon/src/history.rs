@@ -1,7 +1,6 @@
 //! Execution history tracking via a ring buffer per job.
 
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -36,27 +35,10 @@ impl ExecutionHistory {
     }
 
     /// Record a new execution.
-    pub fn record(
-        &self,
-        job_id: &str,
-        scheduled_time: DateTime<Utc>,
-        actual_time: DateTime<Utc>,
-        duration: Duration,
-        outcome: &str,
-        error_message: Option<String>,
-        output: Option<String>,
-    ) {
-        let record = ExecutionRecord {
-            job_id: job_id.to_string(),
-            scheduled_time,
-            actual_time,
-            duration_ms: duration.as_millis() as u64,
-            outcome: outcome.to_string(),
-            error_message,
-            output,
-        };
+    pub fn record(&self, record: ExecutionRecord) {
+        let job_id = record.job_id.clone();
 
-        let mut entry = self.entries.entry(job_id.to_string()).or_default();
+        let mut entry = self.entries.entry(job_id).or_default();
         if entry.len() >= self.max_per_job {
             entry.pop_front();
         }
@@ -72,6 +54,7 @@ impl ExecutionHistory {
     }
 
     /// Get the total number of executions across all jobs.
+    #[allow(dead_code)]
     pub fn total_executions(&self) -> usize {
         self.entries.iter().map(|e| e.value().len()).sum()
     }
@@ -90,15 +73,15 @@ mod tests {
     fn test_record_and_get() {
         let history = ExecutionHistory::new(10);
         let now = Utc::now();
-        history.record(
-            "job1",
-            now,
-            now,
-            Duration::from_millis(100),
-            "success",
-            None,
-            Some("ok".to_string()),
-        );
+        history.record(ExecutionRecord {
+            job_id: "job1".to_string(),
+            scheduled_time: now,
+            actual_time: now,
+            duration_ms: 100,
+            outcome: "success".to_string(),
+            error_message: None,
+            output: Some("ok".to_string()),
+        });
 
         let records = history.get("job1");
         assert_eq!(records.len(), 1);
@@ -111,15 +94,15 @@ mod tests {
         let now = Utc::now();
 
         for i in 0..5 {
-            history.record(
-                "job1",
-                now,
-                now,
-                Duration::from_millis(i * 10),
-                "success",
-                None,
-                None,
-            );
+            history.record(ExecutionRecord {
+                job_id: "job1".to_string(),
+                scheduled_time: now,
+                actual_time: now,
+                duration_ms: i * 10,
+                outcome: "success".to_string(),
+                error_message: None,
+                output: None,
+            });
         }
 
         let records = history.get("job1");

@@ -78,8 +78,8 @@ impl CalendarIntervalTrigger {
     /// Add the calendar interval to a date, clamping the day to the end of
     /// the target month if necessary.
     fn add_interval(&self, date: NaiveDate) -> Option<NaiveDate> {
-        let total_months = self.years as i32 * 12 + self.months as i32;
-        let total_days = self.weeks as i32 * 7 + self.days as i32;
+        let total_months = self.years * 12 + self.months;
+        let total_days = self.weeks * 7 + self.days;
 
         let mut new_date = date;
 

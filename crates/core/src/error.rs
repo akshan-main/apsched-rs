@@ -34,6 +34,8 @@ pub enum SchedulerError {
     ShutdownTimeout,
     #[error("scheduler is paused")]
     SchedulerPaused,
+    #[error("scheduler is shutting down")]
+    SchedulerShuttingDown,
 }
 
 #[derive(Error, Debug, Clone)]

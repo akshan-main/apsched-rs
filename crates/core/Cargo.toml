@@ -25,6 +25,14 @@ crossbeam-channel = { workspace = true }
 bincode = { workspace = true }
 ciborium = { workspace = true }
 rand = "0.8"
+tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry-otlp = { version = "0.27", optional = true, features = ["tonic"] }
+opentelemetry_sdk = { version = "0.27", optional = true, features = ["rt-tokio"] }
+
+[features]
+default = []
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry-otlp", "opentelemetry_sdk"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

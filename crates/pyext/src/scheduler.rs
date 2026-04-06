@@ -757,6 +757,50 @@ fn build_schedule_spec(
         })
         .unwrap_or(config.job_defaults.coalesce);
 
+    // Parse rate_limit
+    let rate_limit = kwargs.and_then(|kw| {
+        kw.get_item("rate_limit").ok().flatten().and_then(|v| {
+            if let Ok(d) = v.downcast::<PyDict>() {
+                let max_executions = d
+                    .get_item("max_executions")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract::<u32>().ok())
+                    .unwrap_or(1);
+                let window_seconds = d
+                    .get_item("window_seconds")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.extract::<u64>().ok())
+                    .unwrap_or(60);
+                Some(apsched_core::model::RateLimit {
+                    max_executions,
+                    window_seconds,
+                })
+            } else {
+                None
+            }
+        })
+    });
+
+    // Parse concurrency_group
+    let concurrency_group = kwargs.and_then(|kw| {
+        kw.get_item("concurrency_group")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<String>().ok())
+    });
+
+    // Parse max_group_instances
+    let max_group_instances = kwargs
+        .and_then(|kw| {
+            kw.get_item("max_group_instances")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<u32>().ok())
+        })
+        .unwrap_or(1);
+
     let mut spec = ScheduleSpec::new(job_id, task, trigger_state);
     spec.name = name;
     spec.executor = executor;
@@ -765,6 +809,9 @@ fn build_schedule_spec(
     spec.replace_existing = replace_existing;
     spec.coalesce = coalesce;
     spec.next_run_time = next_run_time;
+    spec.rate_limit = rate_limit;
+    spec.concurrency_group = concurrency_group;
+    spec.max_group_instances = max_group_instances;
     if let Some(grace) = misfire_grace_time {
         spec.misfire_grace_time = Some(grace);
     }
@@ -1774,6 +1821,62 @@ impl PyBlockingScheduler {
         get_scheduler_info_impl(py, &self.engine, &None, self.started, self.start_time)
     }
 
+    /// Return all dead letter entries as a list of dicts.
+    fn get_dead_letters(&self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(ref engine) = self.engine {
+            let entries = engine.get_dead_letters();
+            let list = PyList::empty(py);
+            for entry in &entries {
+                let d = PyDict::new(py);
+                d.set_item("job_id", &entry.job_id)?;
+                d.set_item("schedule_id", &entry.schedule_id)?;
+                d.set_item("failed_at", entry.failed_at.to_rfc3339())?;
+                d.set_item(
+                    "scheduled_fire_time",
+                    entry.scheduled_fire_time.to_rfc3339(),
+                )?;
+                d.set_item("error_type", &entry.error_type)?;
+                d.set_item("error_message", &entry.error_message)?;
+                d.set_item("traceback", entry.traceback.as_deref())?;
+                d.set_item("attempt", entry.attempt)?;
+                list.append(d)?;
+            }
+            Ok(list.into_any().unbind())
+        } else {
+            Ok(PyList::empty(py).into_any().unbind())
+        }
+    }
+
+    /// Replay a dead letter entry by re-submitting it.
+    fn replay_dead_letter(&mut self, py: Python<'_>, job_id: &str) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            let engine = Arc::clone(engine);
+            let job_id_owned = job_id.to_string();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {}", e)))?;
+            rt.block_on(async {
+                engine
+                    .replay_dead_letter(&job_id_owned)
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    /// Clear all dead letter entries.
+    fn clear_dead_letters(&self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.clear_dead_letters();
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
     fn __repr__(&self) -> String {
         if self.started {
             "BlockingScheduler(running=True)".to_string()
@@ -2590,6 +2693,59 @@ impl PyBackgroundScheduler {
             self.started,
             self.start_time,
         )
+    }
+
+    /// Return all dead letter entries as a list of dicts.
+    fn get_dead_letters(&self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(ref engine) = self.engine {
+            let entries = engine.get_dead_letters();
+            let list = PyList::empty(py);
+            for entry in &entries {
+                let d = PyDict::new(py);
+                d.set_item("job_id", &entry.job_id)?;
+                d.set_item("schedule_id", &entry.schedule_id)?;
+                d.set_item("failed_at", entry.failed_at.to_rfc3339())?;
+                d.set_item(
+                    "scheduled_fire_time",
+                    entry.scheduled_fire_time.to_rfc3339(),
+                )?;
+                d.set_item("error_type", &entry.error_type)?;
+                d.set_item("error_message", &entry.error_message)?;
+                d.set_item("traceback", entry.traceback.as_deref())?;
+                d.set_item("attempt", entry.attempt)?;
+                list.append(d)?;
+            }
+            Ok(list.into_any().unbind())
+        } else {
+            Ok(PyList::empty(py).into_any().unbind())
+        }
+    }
+
+    /// Replay a dead letter entry by re-submitting it.
+    fn replay_dead_letter(&mut self, py: Python<'_>, job_id: &str) -> PyResult<()> {
+        if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            let engine = Arc::clone(engine);
+            let rt = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            rt.block_on(async {
+                engine
+                    .replay_dead_letter(&job_id_owned)
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
+    }
+
+    /// Clear all dead letter entries.
+    fn clear_dead_letters(&self) -> PyResult<()> {
+        if let Some(ref engine) = self.engine {
+            engine.clear_dead_letters();
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err("scheduler is not running"))
+        }
     }
 
     fn __repr__(&self) -> String {

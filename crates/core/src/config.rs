@@ -123,13 +123,14 @@ impl SchedulerConfig {
 
     /// Validate an existing config.
     pub fn validate(&self) -> Result<(), SchedulerError> {
-        if self.timezone != "UTC" && self.timezone != "utc" {
-            if self.timezone.parse::<chrono_tz::Tz>().is_err() {
-                return Err(SchedulerError::InvalidConfiguration(format!(
-                    "invalid timezone: '{}'",
-                    self.timezone
-                )));
-            }
+        if self.timezone != "UTC"
+            && self.timezone != "utc"
+            && self.timezone.parse::<chrono_tz::Tz>().is_err()
+        {
+            return Err(SchedulerError::InvalidConfiguration(format!(
+                "invalid timezone: '{}'",
+                self.timezone
+            )));
         }
         if self.max_instances_default == 0 {
             return Err(SchedulerError::InvalidConfiguration(

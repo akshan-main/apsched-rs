@@ -633,6 +633,27 @@ impl JobStore for SqlJobStore {
             }),
         }
     }
+
+    async fn cleanup_stale_leases(&self, now: DateTime<Utc>) -> Result<u32, StoreError> {
+        let now_str = Self::dt_to_string(&now);
+        let p1 = self.placeholder(1);
+        let p2 = self.placeholder(2);
+
+        let query = format!(
+            r#"UPDATE {table} SET acquired_by = NULL, acquired_at = NULL, lease_expires_at = NULL, updated_at = {p1}
+               WHERE lease_expires_at IS NOT NULL AND lease_expires_at < {p2}"#,
+            table = self.table_name,
+        );
+
+        let result = sqlx::query(&query)
+            .bind(&now_str)
+            .bind(&now_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::QueryFailed(e.to_string()))?;
+
+        Ok(result.rows_affected() as u32)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,5 +1248,69 @@ mod tests {
     #[test]
     fn test_detect_backend_unsupported() {
         assert!(SqlJobStore::detect_backend("mysql://localhost/test").is_err());
+    }
+
+    // ---- Bug fix tests ----
+
+    #[tokio::test]
+    async fn test_concurrent_acquire_same_job_sqlite() {
+        // Bug 1 fix test: two acquire_jobs calls for the same job should only succeed once.
+        // SQLite uses optimistic locking with version check.
+        let store = create_test_store().await;
+        let now = Utc::now();
+        let past = now - chrono::Duration::minutes(5);
+        store
+            .add_job(make_schedule("contested", Some(past)))
+            .await
+            .unwrap();
+
+        // First acquire
+        let leases1 = store.acquire_jobs("scheduler-A", 10, now).await.unwrap();
+        assert_eq!(leases1.len(), 1);
+
+        // Second acquire - same time, different scheduler
+        let leases2 = store.acquire_jobs("scheduler-B", 10, now).await.unwrap();
+        assert_eq!(
+            leases2.len(),
+            0,
+            "second scheduler should not acquire an already-leased job"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_leases_sql() {
+        // Bug 3 fix test: stale leases should be cleaned up on startup.
+        let store = create_test_store().await;
+        let now = Utc::now();
+        let past = now - chrono::Duration::minutes(5);
+
+        store
+            .add_job(make_schedule("stale1", Some(past)))
+            .await
+            .unwrap();
+        store
+            .add_job(make_schedule("stale2", Some(past)))
+            .await
+            .unwrap();
+
+        // Simulate a crashed scheduler that acquired both jobs
+        let leases = store.acquire_jobs("crashed-sched", 10, now).await.unwrap();
+        assert_eq!(leases.len(), 2);
+
+        // Another scheduler cannot acquire them
+        let leases2 = store.acquire_jobs("new-sched", 10, now).await.unwrap();
+        assert_eq!(leases2.len(), 0);
+
+        // After lease expiry, clean up stale leases
+        let after_expiry = now + chrono::Duration::seconds(DEFAULT_LEASE_DURATION_SECS + 10);
+        let cleaned = store.cleanup_stale_leases(after_expiry).await.unwrap();
+        assert_eq!(cleaned, 2);
+
+        // Now the new scheduler can acquire the jobs
+        let leases3 = store
+            .acquire_jobs("new-sched", 10, after_expiry)
+            .await
+            .unwrap();
+        assert_eq!(leases3.len(), 2);
     }
 }

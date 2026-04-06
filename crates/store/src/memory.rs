@@ -261,6 +261,21 @@ impl JobStore for MemoryJobStore {
             .map(|r| *r.value())
             .unwrap_or(0))
     }
+
+    async fn cleanup_stale_leases(&self, now: DateTime<Utc>) -> Result<u32, StoreError> {
+        let mut cleaned = 0u32;
+        let stale_keys: Vec<String> = self
+            .leases
+            .iter()
+            .filter(|entry| entry.value().expires_at < now)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in stale_keys {
+            self.leases.remove(&key);
+            cleaned += 1;
+        }
+        Ok(cleaned)
+    }
 }
 
 #[cfg(test)]
@@ -707,5 +722,77 @@ mod tests {
 
         let due = store.get_due_jobs(now).await.unwrap();
         assert!(due.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_acquire_same_job_only_once() {
+        // Bug 1 fix test: two concurrent acquire_jobs calls for the same job
+        // should only succeed once.
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryJobStore::new());
+        let now = Utc::now();
+        store
+            .add_job(make_schedule("contested", Some(now - Duration::seconds(5))))
+            .await
+            .unwrap();
+
+        let store1 = store.clone();
+        let store2 = store.clone();
+
+        let (leases1, leases2) = tokio::join!(
+            store1.acquire_jobs("sched-A", 10, now),
+            store2.acquire_jobs("sched-B", 10, now),
+        );
+
+        let total = leases1.unwrap().len() + leases2.unwrap().len();
+        // Only one scheduler should have acquired the job
+        assert_eq!(
+            total, 1,
+            "exactly one scheduler should acquire the contested job"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_leases() {
+        // Bug 3 fix test: stale leases should be cleaned up.
+        let store = MemoryJobStore::new();
+        let now = Utc::now();
+
+        store
+            .add_job(make_schedule("job1", Some(now - Duration::seconds(60))))
+            .await
+            .unwrap();
+        store
+            .add_job(make_schedule("job2", Some(now - Duration::seconds(60))))
+            .await
+            .unwrap();
+
+        // Acquire both jobs
+        let leases = store
+            .acquire_jobs("crashed-scheduler", 10, now)
+            .await
+            .unwrap();
+        assert_eq!(leases.len(), 2);
+
+        // Simulate time passing beyond lease expiry
+        let after_expiry = now + Duration::seconds(60);
+
+        // Before cleanup, new scheduler cannot acquire (leases are expired but not cleaned)
+        // Actually for MemoryJobStore, acquire_jobs checks leases.contains_key which doesn't
+        // check expiry. So stale leases DO block. Let's verify and then clean up.
+        let leases2 = store.acquire_jobs("new-scheduler", 10, now).await.unwrap();
+        assert_eq!(leases2.len(), 0, "leases should block acquisition");
+
+        // Cleanup stale leases
+        let cleaned = store.cleanup_stale_leases(after_expiry).await.unwrap();
+        assert_eq!(cleaned, 2);
+
+        // Now the jobs should be acquirable again
+        let leases3 = store
+            .acquire_jobs("new-scheduler", 10, after_expiry)
+            .await
+            .unwrap();
+        assert_eq!(leases3.len(), 2);
     }
 }

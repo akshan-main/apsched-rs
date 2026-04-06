@@ -132,7 +132,7 @@ impl CompiledCronExpr {
             let days_constrained = !self.days.is_all();
             let dow_constrained = !self.weekdays.is_all();
 
-            let day_matched = loop {
+            let day_matched = {
                 let max_day = last_day_of_month(dt.year(), dt.month());
                 match self.find_matching_day(
                     dt.day(),
@@ -142,18 +142,15 @@ impl CompiledCronExpr {
                     days_constrained,
                     dow_constrained,
                 ) {
-                    Some(d) if d == dt.day() => break true,
+                    Some(d) if d == dt.day() => true,
                     Some(d) => {
                         dt = NaiveDateTime::new(
                             NaiveDate::from_ymd_opt(dt.year(), dt.month(), d)?,
                             NaiveTime::from_hms_opt(0, 0, 0)?,
                         );
-                        break true;
+                        true
                     }
-                    None => {
-                        // No matching day in this month, advance to next month.
-                        break false;
-                    }
+                    None => false,
                 }
             };
 
@@ -616,5 +613,94 @@ mod tests {
                 .unwrap();
         let after = utc(2024, 1, 1, 0, 0, 0);
         assert!(expr.get_next_fire_time(after, "UTC").is_none());
+    }
+
+    #[test]
+    fn test_dst_fall_back_2026_no_infinite_loop() {
+        // Bug fix test: DST fall-back on 2026-11-01 at 2:00 AM America/New_York
+        // Clocks go back from 2:00 AM EDT to 1:00 AM EST.
+        // Cron: second=0, minute=0, hour=1 should fire at 1:00 AM (the first occurrence).
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("11"),
+            Some("1"),
+            None,
+            None,
+            Some("1"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+
+        // Start from before 1:00 AM on the fall-back day.
+        // 2026-11-01 04:00:00 UTC = 00:00:00 EDT (midnight).
+        let after = utc(2026, 11, 1, 4, 0, 0);
+        let next = expr.get_next_fire_time(after, "America/New_York");
+        assert!(next.is_some(), "should find a fire time during fall-back");
+        let next = next.unwrap();
+        // 1:00 AM EDT = 05:00 UTC (first occurrence, before fall-back).
+        assert_eq!(next, utc(2026, 11, 1, 5, 0, 0));
+
+        // Now call again from just after the first 1:00 AM occurrence.
+        // This tests that we don't get stuck in an infinite loop returning
+        // the same time. The next fire should be next year (2027-11-01).
+        let next2 = expr.get_next_fire_time(next, "America/New_York");
+        assert!(next2.is_some(), "should find next year's fire time");
+        let next2 = next2.unwrap();
+        assert!(
+            next2 > next,
+            "must strictly advance past the ambiguous time"
+        );
+        // Should be 2027-11-07 (first Sunday of November 2027... actually Nov 1 2027
+        // is a Monday. Fall-back is first Sunday of November.)
+        // In 2027, fall-back is Nov 7. But our cron matches day=1, so it's 2027-11-01.
+        // 2027-11-01 is before fall-back, so 1:00 AM EDT = 05:00 UTC.
+        assert_eq!(next2, utc(2027, 11, 1, 5, 0, 0));
+    }
+
+    #[test]
+    fn test_get_next_fire_time_always_strictly_advances() {
+        // Bug fix test: ensure get_next_fire_time never returns the same time as `after`.
+        let expr = CompiledCronExpr::compile(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0"), // every minute at second=0
+        )
+        .unwrap();
+
+        let t = utc(2024, 6, 15, 12, 0, 0);
+        let next = expr.get_next_fire_time(t, "UTC").unwrap();
+        assert!(next > t, "next fire time must be strictly after `after`");
+    }
+
+    #[test]
+    fn test_dst_fall_back_repeated_calls_advance() {
+        // Bug fix test: repeated calls during DST fall-back should always advance.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("11"),
+            Some("3"),
+            None,
+            None,
+            Some("1"),
+            Some("30"),
+            Some("0"),
+        )
+        .unwrap();
+
+        // 2024-11-03 fall-back at 2:00 AM. 1:30 AM exists twice.
+        let t1 = utc(2024, 11, 3, 4, 0, 0); // midnight ET
+        let next1 = expr.get_next_fire_time(t1, "America/New_York").unwrap();
+        // Call again with the result -- should NOT return the same time.
+        let next2 = expr.get_next_fire_time(next1, "America/New_York");
+        // next2 should either be None (date trigger) or a future time
+        if let Some(n2) = next2 {
+            assert!(n2 > next1, "repeated call must strictly advance");
+        }
     }
 }
