@@ -127,6 +127,41 @@ def list_tools() -> "list[dict]":
             "description": "Resume the entire scheduler.",
             "inputSchema": {"type": "object", "properties": {}},
         },
+        {
+            "name": "list_budgets",
+            "description": (
+                "List all in-process cost budgets and their current state. "
+                "Note: this only returns budgets registered in the same process "
+                "as the MCP server. If the scheduler runs in a separate daemon, "
+                "use the daemon HTTP API instead."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "get_budget",
+            "description": (
+                "Get the status of a single cost budget by name. "
+                "Same in-process limitation as list_budgets."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "pause_jobs_in_budget",
+            "description": (
+                "Pause all jobs that share the given budget. "
+                "Requires budget->job tracking; currently a stub that returns "
+                "an error indicating the wiring is incomplete."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
     ]
 
 
@@ -160,6 +195,23 @@ def call_tool(name: str, args: dict, scheduler_url: str) -> Any:
         return _http_post(scheduler_url, "/api/v1/scheduler/pause")
     if name == "resume_scheduler":
         return _http_post(scheduler_url, "/api/v1/scheduler/resume")
+    if name == "list_budgets":
+        from apscheduler.agents.budget import _BUDGETS, _REGISTRY_LOCK
+        with _REGISTRY_LOCK:
+            return {bname: b.status() for bname, b in _BUDGETS.items()}
+    if name == "get_budget":
+        from apscheduler.agents.budget import _BUDGETS, _REGISTRY_LOCK
+        bname = args['name']
+        with _REGISTRY_LOCK:
+            b = _BUDGETS.get(bname)
+            if b is None:
+                raise ValueError(f"Budget {bname!r} not found")
+            return b.status()
+    if name == "pause_jobs_in_budget":
+        return {
+            "error": "Not implemented: budget->job tracking is not wired yet",
+            "budget": args.get('name'),
+        }
     raise ValueError(f"Unknown tool: {name}")
 
 

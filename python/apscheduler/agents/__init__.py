@@ -15,6 +15,9 @@ from apscheduler.agents.llm import (
     OpenAIProvider,
     register_llm_provider,
     PRICING,
+    function_to_tool_schema,
+    ToolCall,
+    AgentRunResult,
 )
 from apscheduler.agents.budget import (
     CostBudget,
@@ -47,6 +50,10 @@ __all__ = [
     'serve_webhooks',
     'add_llm_job',
     'add_webhook_job',
+    'add_agent_loop',
+    'function_to_tool_schema',
+    'ToolCall',
+    'AgentRunResult',
 ]
 
 
@@ -54,7 +61,8 @@ def _add_llm_job(self, prompt: str, model: str = "claude-sonnet-4-6", schedule=N
                  id: Optional[str] = None, budget: Optional[CostBudget] = None,
                  max_cost_per_run: Optional[float] = None, max_tokens: int = 4096,
                  provider: str = "auto", on_result=None, on_error=None,
-                 trigger=None, **kwargs):
+                 trigger=None, tools: Optional[list] = None,
+                 max_tool_iterations: int = 10, on_complete=None, **kwargs):
     """Add an LLM-call job to the scheduler.
 
     Args:
@@ -66,19 +74,27 @@ def _add_llm_job(self, prompt: str, model: str = "claude-sonnet-4-6", schedule=N
         max_cost_per_run: Max USD per single execution.
         max_tokens: Max tokens to generate.
         provider: 'anthropic', 'openai', 'auto', or registered provider name.
-        on_result: Callback called with LLMResult on success.
+        on_result: Callback called with LLMResult (or AgentRunResult if tools given).
         on_error: Callback called with Exception on failure.
         trigger: Override trigger (overrides schedule).
+        tools: Optional list of Python callables to expose as LLM tools. If set,
+            runs a tool-calling agent loop instead of a single call.
+        max_tool_iterations: Max iterations of the LLM <-> tool loop.
+        on_complete: Alias for on_result, matches agent-loop mental model.
         **kwargs: Additional kwargs passed to add_job.
     """
+    callback = on_result if on_result is not None else on_complete
     job_callable = LLMJob(
         prompt=prompt,
         model=model,
         provider=provider,
         max_tokens=max_tokens,
         max_cost_per_run=max_cost_per_run,
-        on_result=on_result,
+        on_result=callback,
         on_error=on_error,
+        tools=list(tools) if tools else [],
+        max_tool_iterations=max_tool_iterations,
+        budget=budget,
     )
 
     # Wrap to enforce budget
@@ -107,6 +123,46 @@ def _add_llm_job(self, prompt: str, model: str = "claude-sonnet-4-6", schedule=N
             trigger = schedule
 
     return self.add_job(job_callable, trigger, id=id, **kwargs)
+
+
+def _add_agent_loop(self, initial_prompt: str, model: str = "claude-sonnet-4-6",
+                    tools: Optional[list] = None, max_iterations: int = 10,
+                    schedule=None, id: Optional[str] = None,
+                    budget: Optional[CostBudget] = None,
+                    max_cost_per_run: Optional[float] = None,
+                    max_tokens: int = 4096, provider: str = "auto",
+                    on_complete=None, on_error=None, trigger=None, **kwargs):
+    """Add an agent-loop job: an LLM that can call Python tools until it produces a final answer.
+
+    Example:
+        scheduler.add_agent_loop(
+            initial_prompt="Summarize today's open issues and post a summary",
+            model="claude-sonnet-4-6",
+            tools=[get_issues, post_summary],
+            max_iterations=10,
+            budget=CostBudget(per_run=1.00),
+            schedule={'hour': 9},
+            id='daily_summary_agent',
+            on_complete=lambda result: print(result.final_text),
+        )
+    """
+    return _add_llm_job(
+        self,
+        prompt=initial_prompt,
+        model=model,
+        schedule=schedule,
+        id=id,
+        budget=budget,
+        max_cost_per_run=max_cost_per_run,
+        max_tokens=max_tokens,
+        provider=provider,
+        on_result=on_complete,
+        on_error=on_error,
+        trigger=trigger,
+        tools=tools or [],
+        max_tool_iterations=max_iterations,
+        **kwargs,
+    )
 
 
 def _add_webhook_job(self, func, path: str, id: Optional[str] = None,
@@ -140,6 +196,11 @@ def add_webhook_job(scheduler, func, path: str, **kwargs):
     return _add_webhook_job(scheduler, func, path, **kwargs)
 
 
+def add_agent_loop(scheduler, initial_prompt: str, **kwargs):
+    """Functional form of scheduler.add_agent_loop()."""
+    return _add_agent_loop(scheduler, initial_prompt, **kwargs)
+
+
 def _install_agent_methods():
     """Monkey-patch agent methods onto the PyO3 scheduler classes."""
     installed = []
@@ -147,6 +208,7 @@ def _install_agent_methods():
         from apscheduler.schedulers.background import BackgroundScheduler
         BackgroundScheduler.add_llm_job = _add_llm_job
         BackgroundScheduler.add_webhook_job = _add_webhook_job
+        BackgroundScheduler.add_agent_loop = _add_agent_loop
         installed.append('BackgroundScheduler')
     except (ImportError, TypeError, AttributeError):
         pass
@@ -154,6 +216,7 @@ def _install_agent_methods():
         from apscheduler.schedulers.blocking import BlockingScheduler
         BlockingScheduler.add_llm_job = _add_llm_job
         BlockingScheduler.add_webhook_job = _add_webhook_job
+        BlockingScheduler.add_agent_loop = _add_agent_loop
         installed.append('BlockingScheduler')
     except (ImportError, TypeError, AttributeError):
         pass
@@ -161,6 +224,7 @@ def _install_agent_methods():
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         AsyncIOScheduler.add_llm_job = _add_llm_job
         AsyncIOScheduler.add_webhook_job = _add_webhook_job
+        AsyncIOScheduler.add_agent_loop = _add_agent_loop
         installed.append('AsyncIOScheduler')
     except (ImportError, TypeError, AttributeError):
         pass
