@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::SchedulerError;
@@ -12,6 +13,7 @@ pub struct SchedulerConfigBuilder {
     misfire_grace_time_default: Option<Duration>,
     coalesce_default: Option<CoalescePolicy>,
     max_instances_default: Option<u32>,
+    artifact_root: Option<PathBuf>,
 }
 
 impl Default for SchedulerConfigBuilder {
@@ -30,7 +32,14 @@ impl SchedulerConfigBuilder {
             misfire_grace_time_default: None,
             coalesce_default: None,
             max_instances_default: None,
+            artifact_root: None,
         }
+    }
+
+    /// Override the base directory used for per-job artifact storage.
+    pub fn artifact_root(mut self, root: PathBuf) -> Self {
+        self.artifact_root = Some(root);
+        self
     }
 
     /// Set the timezone (IANA timezone string, e.g. "America/New_York").
@@ -111,6 +120,7 @@ impl SchedulerConfigBuilder {
                 .unwrap_or(defaults.misfire_grace_time_default),
             coalesce_default: self.coalesce_default.unwrap_or(defaults.coalesce_default),
             max_instances_default: max_instances,
+            artifact_root: self.artifact_root.or(defaults.artifact_root),
         })
     }
 }

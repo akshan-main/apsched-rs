@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
@@ -12,8 +13,8 @@ use crate::clock::{Clock, WallClock};
 use crate::error::SchedulerError;
 use crate::event::{EventBus, ListenerId, SchedulerEvent};
 use crate::model::{
-    CompletionStatus, DeadLetterEntry, JobChanges, JobCompletion, JobResultEnvelope, JobSpec,
-    ScheduleSpec, SchedulerConfig, SchedulerState, TaskSpec,
+    CompletionStatus, DeadLetterEntry, JobChanges, JobCompletion, JobLogEntry, JobMemory,
+    JobResultEnvelope, JobSpec, ScheduleSpec, SchedulerConfig, SchedulerState, TaskSpec,
 };
 use crate::traits::{Executor, JobStore};
 
@@ -45,7 +46,14 @@ pub struct SchedulerEngine {
     /// Most recent completion record per schedule_id, used to evaluate
     /// DAG-style job dependencies (`depends_on`).
     job_completions: Arc<DashMap<String, JobCompletion>>,
+    /// Per-job persistent memory: state, last_output, logs.
+    job_memory: Arc<DashMap<String, JobMemory>>,
+    /// Resolved base directory for per-job artifact storage.
+    artifact_root: Arc<PathBuf>,
 }
+
+/// Maximum number of log entries retained per job (ring buffer).
+pub const JOB_LOG_RING_CAP: usize = 100;
 
 impl std::fmt::Debug for SchedulerEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -61,6 +69,7 @@ impl SchedulerEngine {
     /// Create a new scheduler engine with the given configuration and clock.
     pub fn new(config: SchedulerConfig, clock: Arc<dyn Clock>) -> Self {
         let (result_tx, result_rx) = mpsc::channel(4096);
+        let artifact_root = Arc::new(config.resolved_artifact_root());
         Self {
             config,
             scheduler_id: Uuid::new_v4().to_string(),
@@ -80,7 +89,87 @@ impl SchedulerEngine {
             rate_windows: Arc::new(DashMap::new()),
             group_running: Arc::new(DashMap::new()),
             job_completions: Arc::new(DashMap::new()),
+            job_memory: Arc::new(DashMap::new()),
+            artifact_root,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Job memory / artifacts API
+    // -----------------------------------------------------------------------
+
+    /// Return a clone of the current memory for a job, if any.
+    pub fn job_memory(&self, job_id: &str) -> Option<JobMemory> {
+        self.job_memory.get(job_id).map(|v| v.clone())
+    }
+
+    /// Set a key/value pair on the job's persistent state.
+    pub fn set_job_state(&self, job_id: &str, key: &str, value: serde_json::Value) {
+        let mut entry = self.job_memory.entry(job_id.to_string()).or_default();
+        entry.state.insert(key.to_string(), value);
+    }
+
+    /// Read a key from the job's persistent state.
+    pub fn get_job_state(&self, job_id: &str, key: &str) -> Option<serde_json::Value> {
+        self.job_memory
+            .get(job_id)
+            .and_then(|m| m.state.get(key).cloned())
+    }
+
+    /// Record the job's "output" for downstream DAG consumers.
+    pub fn set_job_output(&self, job_id: &str, output: serde_json::Value) {
+        let mut entry = self.job_memory.entry(job_id.to_string()).or_default();
+        entry.last_output = Some(output);
+        entry.last_output_at = Some(Utc::now());
+    }
+
+    /// Read the most recent "output" value a job produced.
+    pub fn get_job_output(&self, job_id: &str) -> Option<serde_json::Value> {
+        self.job_memory
+            .get(job_id)
+            .and_then(|m| m.last_output.clone())
+    }
+
+    /// Append a log entry to a job's ring buffer.
+    pub fn append_job_log(&self, job_id: &str, run_id: &str, msg: &str) {
+        let mut entry = self.job_memory.entry(job_id.to_string()).or_default();
+        entry.logs.push(JobLogEntry {
+            timestamp: Utc::now(),
+            message: msg.to_string(),
+            run_id: run_id.to_string(),
+        });
+        while entry.logs.len() > JOB_LOG_RING_CAP {
+            entry.logs.remove(0);
+        }
+    }
+
+    /// Return up to `limit` most-recent log entries for a job (oldest first).
+    pub fn get_job_logs(&self, job_id: &str, limit: usize) -> Vec<JobLogEntry> {
+        match self.job_memory.get(job_id) {
+            None => Vec::new(),
+            Some(mem) => {
+                let len = mem.logs.len();
+                let start = len.saturating_sub(limit);
+                mem.logs[start..].to_vec()
+            }
+        }
+    }
+
+    /// Return (and create if missing) the artifact directory for a job.
+    pub fn artifact_dir_for(&self, job_id: &str) -> PathBuf {
+        let dir = self.artifact_root.as_ref().join(job_id);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Override the artifact root at runtime. Mostly used for tests.
+    pub fn set_artifact_root(&mut self, root: PathBuf) {
+        self.artifact_root = Arc::new(root);
+    }
+
+    /// Return the current artifact root path.
+    pub fn artifact_root(&self) -> &PathBuf {
+        self.artifact_root.as_ref()
     }
 
     /// Return the most recent completion record for a schedule, if any.

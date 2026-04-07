@@ -321,6 +321,10 @@ struct PythonAwareExecutor {
     /// When set, coroutines returned by async callables are scheduled on this
     /// loop via `asyncio.run_coroutine_threadsafe`.
     event_loop: Option<PyObject>,
+    /// Optional reference to the owning scheduler engine. When set, the
+    /// executor can build `JobContext` objects for jobs that opt in via
+    /// `wants_context`, and auto-store return values as job outputs.
+    engine: parking_lot::RwLock<Option<Arc<SchedulerEngine>>>,
 }
 
 impl std::fmt::Debug for PythonAwareExecutor {
@@ -340,12 +344,19 @@ impl PythonAwareExecutor {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             event_loop: None,
+            engine: parking_lot::RwLock::new(None),
         }
     }
 
     fn with_event_loop(mut self, loop_obj: PyObject) -> Self {
         self.event_loop = Some(loop_obj);
         self
+    }
+
+    /// Inject a back-reference to the SchedulerEngine. Called from the
+    /// Python scheduler `start()` once the engine has been built.
+    fn set_engine(&self, engine: Arc<SchedulerEngine>) {
+        *self.engine.write() = Some(engine);
     }
 }
 
@@ -398,10 +409,14 @@ impl Executor for PythonAwareExecutor {
             .event_loop
             .as_ref()
             .map(|l| Python::with_gil(|py| Arc::new(l.clone_ref(py))));
+        let engine_arc: Option<Arc<SchedulerEngine>> = self.engine.read().clone();
         let job_id = job.id;
         let schedule_id = job.schedule_id.clone();
         let task = job.task.clone();
         let timeout_dur = job.timeout;
+        let wants_context = job.wants_context;
+        let scheduled_fire_time = job.scheduled_fire_time;
+        let attempt = job.attempt;
 
         tokio::spawn(async move {
             // Offload the actual Python call onto a blocking thread so that
@@ -411,9 +426,22 @@ impl Executor for PythonAwareExecutor {
                 let callable_store = Arc::clone(&callable_store);
                 let task = task.clone();
                 let event_loop = event_loop.clone();
+                let engine_arc = engine_arc.clone();
+                let schedule_id_inner = schedule_id.clone();
                 tokio::task::spawn_blocking(move || {
                     Python::with_gil(|py| {
                         let loop_ref = event_loop.as_ref().map(|arc| arc.as_ref());
+                        let ctx_info = if wants_context {
+                            engine_arc.as_ref().map(|engine| ContextInfo {
+                                engine: Arc::clone(engine),
+                                schedule_id: schedule_id_inner.clone(),
+                                scheduled_fire_time,
+                                attempt,
+                                run_id: job_id.to_string(),
+                            })
+                        } else {
+                            None
+                        };
                         match run_python_callable(
                             py,
                             &task.callable_ref,
@@ -421,8 +449,24 @@ impl Executor for PythonAwareExecutor {
                             &task.args,
                             &task.kwargs,
                             loop_ref,
+                            ctx_info.as_ref(),
                         ) {
-                            Ok(_) => JobOutcome::Success,
+                            Ok(return_val) => {
+                                // Auto-store the return value as the job's
+                                // output for downstream DAG consumers, when
+                                // the value is non-None and JSON-encodable.
+                                if let Some(engine) = engine_arc.as_ref() {
+                                    let bound = return_val.bind(py);
+                                    if !bound.is_none() {
+                                        if let Ok(json_val) =
+                                            crate::job_context::py_to_json(py, bound)
+                                        {
+                                            engine.set_job_output(&schedule_id_inner, json_val);
+                                        }
+                                    }
+                                }
+                                JobOutcome::Success
+                            }
                             Err(e) => JobOutcome::Error(format!("{}", e)),
                         }
                     })
@@ -609,9 +653,12 @@ fn parse_trigger(
                     .map(|v| crate::triggers::extract_timezone(Some(&v)))
                     .transpose()?
                     .unwrap_or_else(|| "UTC".to_string());
+                // When no run_date provided, default to "soon" (200ms ahead)
+                // so the job reliably fires inside the misfire grace window
+                // instead of racing the clock at exactly "now".
                 let dt = match run_date {
                     Some(ref obj) => py_to_datetime(obj)?,
-                    None => Utc::now(),
+                    None => Utc::now() + chrono::Duration::milliseconds(200),
                 };
                 let t = apsched_triggers::DateTrigger::new(dt, tz)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -829,6 +876,57 @@ fn parse_trigger(
     Err(PyTypeError::new_err(
         "trigger must be a string name, a trigger object, or an object with a get_next_fire_time() method",
     ))
+}
+
+/// Apply the optional `artifact_root` kwarg to a SchedulerConfig in-place.
+/// Accepts a string (path) or a `pathlib.Path` (anything coercible via str()).
+fn apply_artifact_root_kwarg(kw: &Bound<'_, PyDict>, config: &mut SchedulerConfig) -> PyResult<()> {
+    if let Some(val) = kw.get_item("artifact_root")? {
+        if !val.is_none() {
+            // Try string first; otherwise stringify (handles pathlib.Path).
+            let s: String = if let Ok(s) = val.extract::<String>() {
+                s
+            } else {
+                val.str()?.to_string()
+            };
+            config.artifact_root = Some(std::path::PathBuf::from(s));
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort signature inspection: returns true when the callable's first
+/// positional parameter is named `ctx` or `context`. Uses `inspect.signature`
+/// and silently treats any error (builtins, partials, C funcs) as "no context".
+fn detect_ctx_param(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let inspect = py.import("inspect")?;
+    let sig = match inspect.call_method1("signature", (func,)) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let params = sig.getattr("parameters")?;
+    // parameters is an OrderedDict; iterate to get the first key
+    let values = params.call_method0("values")?;
+    let iter = values.try_iter()?;
+    for item in iter {
+        let item = item?;
+        // Skip *args / **kwargs / keyword-only by only accepting the first
+        // POSITIONAL_OR_KEYWORD or POSITIONAL_ONLY parameter.
+        let kind = item.getattr("kind")?;
+        let kind_str = kind.str()?.to_string();
+        if kind_str.contains("VAR_") {
+            // *args/**kwargs — skip and look at the next one (rare case
+            // where ctx might still appear after *args, but generally not
+            // useful since it can't be passed positionally then).
+            continue;
+        }
+        if kind_str.contains("KEYWORD_ONLY") {
+            return Ok(false);
+        }
+        let name: String = item.getattr("name")?.extract()?;
+        return Ok(name == "ctx" || name == "context");
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1199,26 @@ fn build_schedule_spec(
         })
         .unwrap_or(false);
 
+    // Detect whether the job wants a JobContext injected. Two ways:
+    //   1. Caller passes wants_context=True explicitly.
+    //   2. The callable's signature has a first positional parameter named
+    //      `ctx` or `context`. Best-effort: failures (e.g., builtins) fall
+    //      back to "no context".
+    let explicit_wants_context = kwargs
+        .and_then(|kw| {
+            kw.get_item("wants_context")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<bool>().ok())
+        })
+        .unwrap_or(false);
+
+    let wants_context = if explicit_wants_context {
+        true
+    } else {
+        detect_ctx_param(py, func).unwrap_or(false)
+    };
+
     let mut spec = ScheduleSpec::new(job_id, task, trigger_state);
     spec.name = name;
     spec.executor = executor;
@@ -1115,6 +1233,7 @@ fn build_schedule_spec(
     spec.timeout = timeout;
     spec.depends_on = depends_on;
     spec.run_on_failure = run_on_failure;
+    spec.wants_context = wants_context;
     if let Some(grace) = misfire_grace_time {
         spec.misfire_grace_time = Some(grace);
     }
@@ -1126,6 +1245,16 @@ fn build_schedule_spec(
 // Run a Python callable
 // ---------------------------------------------------------------------------
 
+/// Information needed to construct a `JobContext` and inject it into a
+/// callable. Cheap to clone since `engine` is an `Arc`.
+pub(crate) struct ContextInfo {
+    pub engine: Arc<SchedulerEngine>,
+    pub schedule_id: String,
+    pub scheduled_fire_time: chrono::DateTime<chrono::Utc>,
+    pub attempt: u32,
+    pub run_id: String,
+}
+
 fn run_python_callable(
     py: Python<'_>,
     callable_ref: &CallableRef,
@@ -1133,6 +1262,7 @@ fn run_python_callable(
     args: &[SerializedValue],
     kwargs: &HashMap<String, SerializedValue>,
     event_loop: Option<&PyObject>,
+    ctx_info: Option<&ContextInfo>,
 ) -> PyResult<PyObject> {
     // Resolve the callable
     let func: PyObject = match callable_ref {
@@ -1160,10 +1290,32 @@ fn run_python_callable(
     let args_tuple = py_args.bind(py);
     let kwargs_dict = py_kwargs.bind(py);
 
-    let args_tuple = args_tuple.downcast::<PyTuple>()?;
+    let args_tuple_typed = args_tuple.downcast::<PyTuple>()?;
     let kwargs_dict = kwargs_dict.downcast::<PyDict>()?;
 
-    let result = func.bind(py).call(args_tuple, Some(kwargs_dict))?;
+    // If a context is requested, prepend a JobContext as the first
+    // positional argument.
+    let final_args: Bound<'_, PyTuple> = if let Some(info) = ctx_info {
+        let scheduled_py = crate::convert::datetime_to_py(py, info.scheduled_fire_time)?;
+        let ctx = crate::job_context::PyJobContext {
+            job_id: info.schedule_id.clone(),
+            scheduled_time: scheduled_py,
+            attempt: info.attempt.saturating_sub(1),
+            run_id: info.run_id.clone(),
+            engine: Arc::clone(&info.engine),
+        };
+        let ctx_obj = ctx.into_pyobject(py)?.into_any();
+        let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args_tuple_typed.len() + 1);
+        items.push(ctx_obj);
+        for item in args_tuple_typed.iter() {
+            items.push(item);
+        }
+        PyTuple::new(py, items)?
+    } else {
+        args_tuple_typed.clone()
+    };
+
+    let result = func.bind(py).call(&final_args, Some(kwargs_dict))?;
 
     // If the result is a coroutine (async function), we need to await it.
     let inspect = py.import("inspect")?;
@@ -1413,6 +1565,7 @@ impl PyBlockingScheduler {
             {
                 config.daemon = daemon;
             }
+            apply_artifact_root_kwarg(kw, &mut config)?;
             // Parse job_defaults
             if let Some(jd) = kw.get_item("job_defaults")? {
                 if let Ok(d) = jd.downcast::<PyDict>() {
@@ -1488,8 +1641,12 @@ impl PyBlockingScheduler {
 
         // Add default executor (Python-aware so it can invoke Python callables)
         let default_executor = Arc::new(PythonAwareExecutor::new(Arc::clone(&callable_store), 10));
+        default_executor.set_engine(Arc::clone(&engine));
         engine
-            .add_executor(default_executor, "default")
+            .add_executor(
+                Arc::clone(&default_executor) as Arc<dyn Executor>,
+                "default",
+            )
             .map_err(scheduler_error_to_pyerr)?;
 
         // Add user-configured stores (pending stores, materialized with this runtime)
@@ -1520,8 +1677,9 @@ impl PyBlockingScheduler {
                     Arc::clone(&callable_store),
                     py_exec.max_workers,
                 ));
+                executor.set_engine(Arc::clone(&engine));
                 engine
-                    .add_executor(executor, alias)
+                    .add_executor(executor as Arc<dyn Executor>, alias)
                     .map_err(scheduler_error_to_pyerr)?;
             }
         }
@@ -2240,6 +2398,7 @@ impl PyBackgroundScheduler {
             {
                 config.daemon = daemon;
             }
+            apply_artifact_root_kwarg(kw, &mut config)?;
             if let Some(jd) = kw.get_item("job_defaults")? {
                 if let Ok(d) = jd.downcast::<PyDict>() {
                     if let Some(grace) = d
@@ -2310,11 +2469,17 @@ impl PyBackgroundScheduler {
             Arc::new(apsched_core::WallClock),
         ));
 
-        // Add default executor (Python-aware so it can invoke Python callables)
+        // Add default executor (Python-aware so it can invoke Python callables).
+        // We keep a typed Arc so we can wire the engine back-reference for
+        // JobContext support before installing it.
         let callable_store = Arc::clone(&self.callable_store);
         let default_executor = Arc::new(PythonAwareExecutor::new(Arc::clone(&callable_store), 10));
+        default_executor.set_engine(Arc::clone(&engine));
         engine
-            .add_executor(default_executor, "default")
+            .add_executor(
+                Arc::clone(&default_executor) as Arc<dyn Executor>,
+                "default",
+            )
             .map_err(scheduler_error_to_pyerr)?;
 
         // Add user stores (pending stores, materialized with this runtime).
@@ -2357,8 +2522,9 @@ impl PyBackgroundScheduler {
                     Arc::clone(&callable_store),
                     py_exec.max_workers,
                 ));
+                executor.set_engine(Arc::clone(&engine));
                 engine
-                    .add_executor(executor, alias)
+                    .add_executor(executor as Arc<dyn Executor>, alias)
                     .map_err(scheduler_error_to_pyerr)?;
             }
         }
@@ -2675,6 +2841,19 @@ impl PyBackgroundScheduler {
                         task_changed = true;
                     }
                 }
+                if let Some(nrt_obj) = kw.get_item("next_run_time")? {
+                    if nrt_obj.is_none() {
+                        changes.next_run_time = Some(None);
+                    } else {
+                        let dt = crate::convert::py_to_datetime(&nrt_obj)?;
+                        changes.next_run_time = Some(Some(dt));
+                    }
+                }
+                if let Some(paused_obj) = kw.get_item("paused")? {
+                    if let Ok(p) = paused_obj.extract::<bool>() {
+                        changes.paused = Some(p);
+                    }
+                }
             }
             if task_changed {
                 changes.task = Some(new_task);
@@ -2691,6 +2870,9 @@ impl PyBackgroundScheduler {
                     .await
                     .map_err(scheduler_error_to_pyerr)
             })?;
+
+            // Wake up the scheduler so it picks up the new next_run_time immediately
+            engine_arc.wakeup();
 
             let py_job = PyJob::from_spec(py, &spec)?;
             let py_job_obj = py_job.into_pyobject(py)?.into_any().unbind();
@@ -3203,6 +3385,7 @@ impl PyAsyncIOScheduler {
             {
                 config.timezone = tz;
             }
+            apply_artifact_root_kwarg(kw, &mut config)?;
             if let Some(jd) = kw.get_item("job_defaults")? {
                 if let Ok(d) = jd.downcast::<PyDict>() {
                     if let Some(grace) = d
@@ -3301,8 +3484,12 @@ impl PyAsyncIOScheduler {
         let default_executor = Arc::new(
             PythonAwareExecutor::new(Arc::clone(&callable_store), 10).with_event_loop(event_loop),
         );
+        default_executor.set_engine(Arc::clone(&engine));
         engine
-            .add_executor(default_executor, "default")
+            .add_executor(
+                Arc::clone(&default_executor) as Arc<dyn Executor>,
+                "default",
+            )
             .map_err(scheduler_error_to_pyerr)?;
 
         // Register listeners

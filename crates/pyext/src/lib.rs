@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 mod convert;
 mod events;
 mod executors;
+mod job_context;
 mod plugin_trigger;
 mod scheduler;
 mod stores;
@@ -41,6 +42,9 @@ fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register Job class
     m.add_class::<scheduler::PyJob>()?;
+
+    // Register JobContext class (used by jobs that opt-in via wants_context).
+    m.add_class::<job_context::PyJobContext>()?;
 
     // Register event constants and classes
     events::register_events(m)?;

@@ -2,8 +2,30 @@ use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// A single log entry appended by a job via `ctx.log(...)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub message: String,
+    pub run_id: String,
+}
+
+/// In-memory key/value storage scoped per job, with output for DAG passing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct JobMemory {
+    /// Per-job key/value storage. Persists across runs of the same job.
+    pub state: HashMap<String, serde_json::Value>,
+    /// The "output" that downstream DAG jobs can read.
+    pub last_output: Option<serde_json::Value>,
+    /// Timestamp of last successful output.
+    pub last_output_at: Option<DateTime<Utc>>,
+    /// Per-run logs (last N entries, ring buffer).
+    pub logs: Vec<JobLogEntry>,
+}
 
 /// An entry in the dead letter queue, representing a job that failed after
 /// exhausting all retries (or with no retry policy).
@@ -495,6 +517,11 @@ pub struct ScheduleSpec {
     /// which requires all upstream dependencies to succeed.
     #[serde(default)]
     pub run_on_failure: bool,
+    /// If true, the executor should pass a `JobContext` as the first positional
+    /// argument when invoking the callable. Detected via signature inspection
+    /// or an explicit `wants_context=True` at add_job time.
+    #[serde(default)]
+    pub wants_context: bool,
 }
 
 fn default_max_group_instances() -> u32 {
@@ -525,6 +552,7 @@ impl ScheduleSpec {
             timeout: None,
             depends_on: Vec::new(),
             run_on_failure: false,
+            wants_context: false,
         }
     }
 
@@ -569,6 +597,10 @@ pub struct JobSpec {
     /// the call does not complete within this duration.
     #[serde(default, with = "option_duration_serde")]
     pub timeout: Option<Duration>,
+    /// Whether this job wants a `JobContext` injected as the first positional
+    /// argument when invoked.
+    #[serde(default)]
+    pub wants_context: bool,
 }
 
 impl JobSpec {
@@ -589,6 +621,7 @@ impl JobSpec {
             deadline,
             attempt: 1,
             timeout: schedule.timeout,
+            wants_context: schedule.wants_context,
         }
     }
 }
@@ -695,6 +728,26 @@ pub struct SchedulerConfig {
     pub misfire_grace_time_default: Duration,
     pub coalesce_default: CoalescePolicy,
     pub max_instances_default: u32,
+    /// Base directory for per-job artifact storage (`ctx.artifact_dir`).
+    /// Defaults to `{tempdir}/apscheduler-rs/artifacts` when not set.
+    #[serde(default)]
+    pub artifact_root: Option<PathBuf>,
+}
+
+impl SchedulerConfig {
+    /// Resolve the artifact root, falling back to the system default.
+    pub fn resolved_artifact_root(&self) -> PathBuf {
+        self.artifact_root
+            .clone()
+            .unwrap_or_else(default_artifact_root)
+    }
+}
+
+/// The default artifact root used when `SchedulerConfig::artifact_root` is None.
+pub fn default_artifact_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("apscheduler-rs")
+        .join("artifacts")
 }
 
 impl Default for SchedulerConfig {
@@ -706,6 +759,7 @@ impl Default for SchedulerConfig {
             misfire_grace_time_default: Duration::from_secs(1),
             coalesce_default: CoalescePolicy::On,
             max_instances_default: 1,
+            artifact_root: None,
         }
     }
 }

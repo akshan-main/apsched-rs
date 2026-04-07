@@ -50,6 +50,7 @@ mod tests {
             deadline: None,
             attempt: 1,
             timeout: None,
+            wants_context: false,
         }
     }
 
