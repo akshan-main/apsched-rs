@@ -49,6 +49,7 @@ mod tests {
             actual_fire_time: None,
             deadline: None,
             attempt: 1,
+            timeout: None,
         }
     }
 

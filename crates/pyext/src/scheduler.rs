@@ -401,22 +401,68 @@ impl Executor for PythonAwareExecutor {
         let job_id = job.id;
         let schedule_id = job.schedule_id.clone();
         let task = job.task.clone();
+        let timeout_dur = job.timeout;
 
         tokio::spawn(async move {
-            let outcome = Python::with_gil(|py| {
-                let loop_ref = event_loop.as_ref().map(|arc| arc.as_ref());
-                match run_python_callable(
-                    py,
-                    &task.callable_ref,
-                    &callable_store,
-                    &task.args,
-                    &task.kwargs,
-                    loop_ref,
-                ) {
-                    Ok(_) => JobOutcome::Success,
-                    Err(e) => JobOutcome::Error(format!("{}", e)),
+            // Offload the actual Python call onto a blocking thread so that
+            // the timer driving `tokio::time::timeout` can make progress
+            // even while the Python code holds the GIL.
+            let run_task = {
+                let callable_store = Arc::clone(&callable_store);
+                let task = task.clone();
+                let event_loop = event_loop.clone();
+                tokio::task::spawn_blocking(move || {
+                    Python::with_gil(|py| {
+                        let loop_ref = event_loop.as_ref().map(|arc| arc.as_ref());
+                        match run_python_callable(
+                            py,
+                            &task.callable_ref,
+                            &callable_store,
+                            &task.args,
+                            &task.kwargs,
+                            loop_ref,
+                        ) {
+                            Ok(_) => JobOutcome::Success,
+                            Err(e) => JobOutcome::Error(format!("{}", e)),
+                        }
+                    })
+                })
+            };
+
+            let outcome = if let Some(dur) = timeout_dur {
+                match tokio::time::timeout(dur, run_task).await {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(join_err)) => {
+                        JobOutcome::Error(format!("job task join error: {}", join_err))
+                    }
+                    Err(_elapsed) => {
+                        // Timeout fired.  We cannot force-terminate a
+                        // Python callable holding the GIL, so the
+                        // blocking task is deliberately leaked to run
+                        // to completion in the background.  The
+                        // scheduler frees the slot and reports an
+                        // error so downstream instances can proceed.
+                        tracing::warn!(
+                            schedule_id = %schedule_id,
+                            timeout_secs = dur.as_secs_f64(),
+                            "job exceeded timeout; reporting TimeoutError \
+                             (Python code will continue running in the \
+                             background until it completes)"
+                        );
+                        JobOutcome::Error(format!(
+                            "TimeoutError: job exceeded timeout of {:.3}s",
+                            dur.as_secs_f64()
+                        ))
+                    }
                 }
-            });
+            } else {
+                match run_task.await {
+                    Ok(outcome) => outcome,
+                    Err(join_err) => {
+                        JobOutcome::Error(format!("job task join error: {}", join_err))
+                    }
+                }
+            };
 
             let envelope = JobResultEnvelope {
                 job_id,
@@ -472,6 +518,15 @@ pub struct PyJob {
     args: PyObject,
     #[pyo3(get)]
     kwargs: PyObject,
+    /// Per-job execution timeout in seconds (float), or None.
+    #[pyo3(get)]
+    timeout: Option<f64>,
+    /// List of upstream job IDs for DAG dependencies.
+    #[pyo3(get)]
+    depends_on: Vec<String>,
+    /// Whether dependency trigger fires on upstream failure.
+    #[pyo3(get)]
+    run_on_failure: bool,
 }
 
 #[pymethods]
@@ -527,6 +582,9 @@ impl PyJob {
             jobstore: spec.jobstore.clone(),
             args: args_obj,
             kwargs: kwargs_obj,
+            timeout: spec.timeout.map(|d| d.as_secs_f64()),
+            depends_on: spec.depends_on.clone(),
+            run_on_failure: spec.run_on_failure,
         })
     }
 }
@@ -828,8 +886,34 @@ fn build_schedule_spec(
     } else {
         kwargs.cloned()
     };
+    // Peek at depends_on early so we can pick the right default trigger
+    // for dependency-driven jobs (they should not fire on a wall clock).
+    let has_depends_on = kwargs
+        .and_then(|kw| kw.get_item("depends_on").ok().flatten())
+        .map(|v| {
+            if v.is_none() {
+                false
+            } else {
+                v.try_iter()
+                    .ok()
+                    .and_then(|it| it.collect::<PyResult<Vec<_>>>().ok())
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false)
+            }
+        })
+        .unwrap_or(false);
+
     let rust_trigger: Box<dyn Trigger> = if let Some(trig) = trigger {
         parse_trigger(py, trig, effective_trigger_args.as_ref())?
+    } else if has_depends_on {
+        // Dependency-driven job with no explicit trigger: use a
+        // far-future date placeholder that never fires on its own.
+        // The scheduler triggers it when upstream jobs complete.
+        let dt = Utc::now() + chrono::Duration::days(365 * 100);
+        Box::new(
+            apsched_triggers::DateTrigger::new(dt, config.timezone.clone())
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )
     } else {
         // Default: date trigger (run now)
         let dt = Utc::now();
@@ -841,7 +925,13 @@ fn build_schedule_spec(
 
     let trigger_state = rust_trigger.serialize_state();
     let now = Utc::now();
-    let next_run_time = rust_trigger.get_next_fire_time(None, now);
+    let next_run_time = if has_depends_on {
+        // DAG jobs start with no wall-clock next_run_time; they are
+        // triggered by upstream completion.
+        None
+    } else {
+        rust_trigger.get_next_fire_time(None, now)
+    };
 
     // Extract optional schedule parameters from kwargs
     let job_id = kwargs
@@ -964,6 +1054,53 @@ fn build_schedule_spec(
         })
         .unwrap_or(1);
 
+    // Parse timeout (accept int or float seconds).
+    let timeout = kwargs.and_then(|kw| {
+        kw.get_item("timeout").ok().flatten().and_then(|v| {
+            if v.is_none() {
+                None
+            } else if let Ok(f) = v.extract::<f64>() {
+                if f > 0.0 {
+                    Some(std::time::Duration::from_secs_f64(f))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    });
+
+    // Parse depends_on (list of schedule ids)
+    let depends_on: Vec<String> = kwargs
+        .and_then(|kw| {
+            kw.get_item("depends_on").ok().flatten().and_then(|v| {
+                if v.is_none() {
+                    None
+                } else {
+                    v.try_iter()
+                        .ok()
+                        .and_then(|it| it.collect::<PyResult<Vec<_>>>().ok())
+                        .map(|items| {
+                            items
+                                .into_iter()
+                                .filter_map(|it| it.extract::<String>().ok())
+                                .collect()
+                        })
+                }
+            })
+        })
+        .unwrap_or_default();
+
+    let run_on_failure = kwargs
+        .and_then(|kw| {
+            kw.get_item("run_on_failure")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<bool>().ok())
+        })
+        .unwrap_or(false);
+
     let mut spec = ScheduleSpec::new(job_id, task, trigger_state);
     spec.name = name;
     spec.executor = executor;
@@ -975,6 +1112,9 @@ fn build_schedule_spec(
     spec.rate_limit = rate_limit;
     spec.concurrency_group = concurrency_group;
     spec.max_group_instances = max_group_instances;
+    spec.timeout = timeout;
+    spec.depends_on = depends_on;
+    spec.run_on_failure = run_on_failure;
     if let Some(grace) = misfire_grace_time {
         spec.misfire_grace_time = Some(grace);
     }

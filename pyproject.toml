@@ -34,7 +34,8 @@ dependencies = [
 sqlalchemy = ["sqlalchemy>=2.0"]
 mongodb = ["pymongo>=4.0"]
 redis = ["redis>=5.0"]
-all = ["apscheduler-rs[sqlalchemy,mongodb,redis]"]
+django = ["django>=4.0"]
+all = ["apscheduler-rs[sqlalchemy,mongodb,redis,django]"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

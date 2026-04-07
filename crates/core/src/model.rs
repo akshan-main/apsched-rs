@@ -472,6 +472,29 @@ pub struct ScheduleSpec {
     /// Maximum concurrent instances across the concurrency group.
     #[serde(default = "default_max_group_instances")]
     pub max_group_instances: u32,
+    /// Optional wall-clock timeout for a single execution of this job.
+    /// When the timeout elapses before the callable returns, the scheduler
+    /// reports a `TimeoutError` via `JobOutcome::Error` and frees the
+    /// execution slot.
+    ///
+    /// Note: for Python callables, the underlying interpreter cannot be
+    /// force-terminated mid-execution due to GIL constraints.  The Python
+    /// code continues running to completion in the background, but the
+    /// scheduler considers the slot freed so that subsequent fires can
+    /// proceed on schedule.
+    #[serde(default, with = "option_duration_serde")]
+    pub timeout: Option<Duration>,
+    /// Job IDs that must complete before this job runs.  When non-empty,
+    /// the job is triggered by upstream completion rather than by its own
+    /// time trigger.  The `trigger_state` is ignored for dependency-driven
+    /// jobs (typically set to a placeholder by the caller).
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// If true, the dependency trigger fires even when one or more upstream
+    /// jobs failed (dependency becomes "any completion").  Default: false,
+    /// which requires all upstream dependencies to succeed.
+    #[serde(default)]
+    pub run_on_failure: bool,
 }
 
 fn default_max_group_instances() -> u32 {
@@ -499,6 +522,9 @@ impl ScheduleSpec {
             rate_limit: None,
             concurrency_group: None,
             max_group_instances: 1,
+            timeout: None,
+            depends_on: Vec::new(),
+            run_on_failure: false,
         }
     }
 
@@ -538,6 +564,11 @@ pub struct JobSpec {
     pub actual_fire_time: Option<DateTime<Utc>>,
     pub deadline: Option<DateTime<Utc>>,
     pub attempt: u32,
+    /// Optional execution timeout copied from the schedule.  The executor
+    /// is expected to report a `TimeoutError` via `JobOutcome::Error` if
+    /// the call does not complete within this duration.
+    #[serde(default, with = "option_duration_serde")]
+    pub timeout: Option<Duration>,
 }
 
 impl JobSpec {
@@ -557,6 +588,7 @@ impl JobSpec {
             actual_fire_time: None,
             deadline,
             attempt: 1,
+            timeout: schedule.timeout,
         }
     }
 }
@@ -576,6 +608,22 @@ pub enum SkipReason {
     MaxInstancesReached,
     CoalescedAway,
     Paused,
+}
+
+/// Status of the last completed run of a job, used for dependency
+/// evaluation in DAG-style workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompletionStatus {
+    Success,
+    Failure,
+}
+
+/// Record of the most recent completion for a job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobCompletion {
+    pub schedule_id: String,
+    pub last_run: DateTime<Utc>,
+    pub status: CompletionStatus,
 }
 
 /// A lease on a job, used for distributed locking.
@@ -677,6 +725,10 @@ pub struct JobChanges {
     /// Fully replace the task spec (used when args/kwargs change at runtime).
     #[serde(default)]
     pub task: Option<TaskSpec>,
+    /// Replace the per-job execution timeout.  Outer `Some` means "apply";
+    /// inner `None` clears the timeout.
+    #[serde(default)]
+    pub timeout: Option<Option<Duration>>,
 }
 
 impl JobChanges {
@@ -711,6 +763,9 @@ impl JobChanges {
         }
         if let Some(task) = self.task {
             spec.task = task;
+        }
+        if let Some(timeout) = self.timeout {
+            spec.timeout = timeout;
         }
         spec.version += 1;
     }

@@ -12,8 +12,8 @@ use crate::clock::{Clock, WallClock};
 use crate::error::SchedulerError;
 use crate::event::{EventBus, ListenerId, SchedulerEvent};
 use crate::model::{
-    DeadLetterEntry, JobChanges, JobResultEnvelope, JobSpec, ScheduleSpec, SchedulerConfig,
-    SchedulerState, TaskSpec,
+    CompletionStatus, DeadLetterEntry, JobChanges, JobCompletion, JobResultEnvelope, JobSpec,
+    ScheduleSpec, SchedulerConfig, SchedulerState, TaskSpec,
 };
 use crate::traits::{Executor, JobStore};
 
@@ -42,6 +42,9 @@ pub struct SchedulerEngine {
     rate_windows: Arc<DashMap<String, VecDeque<DateTime<Utc>>>>,
     /// Running instance counts per concurrency group.
     group_running: Arc<DashMap<String, AtomicU32>>,
+    /// Most recent completion record per schedule_id, used to evaluate
+    /// DAG-style job dependencies (`depends_on`).
+    job_completions: Arc<DashMap<String, JobCompletion>>,
 }
 
 impl std::fmt::Debug for SchedulerEngine {
@@ -76,7 +79,19 @@ impl SchedulerEngine {
             dead_letter_max: 1000,
             rate_windows: Arc::new(DashMap::new()),
             group_running: Arc::new(DashMap::new()),
+            job_completions: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Return the most recent completion record for a schedule, if any.
+    pub fn job_completion(&self, schedule_id: &str) -> Option<JobCompletion> {
+        self.job_completions.get(schedule_id).map(|v| v.clone())
+    }
+
+    /// Return a reference to the completion map (used by the loop context).
+    #[allow(dead_code)]
+    pub(crate) fn job_completions_arc(&self) -> &Arc<DashMap<String, JobCompletion>> {
+        &self.job_completions
     }
 
     /// Create a new scheduler with default configuration and wall clock.
@@ -202,6 +217,7 @@ impl SchedulerEngine {
             dead_letter_max: self.dead_letter_max,
             rate_windows: Arc::clone(&self.rate_windows),
             group_running: Arc::clone(&self.group_running),
+            job_completions: Arc::clone(&self.job_completions),
             clock: Arc::clone(&self.clock),
             wakeup_notify: Arc::clone(&self.wakeup_notify),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
@@ -827,6 +843,7 @@ struct SchedulerLoopContext {
     dead_letter_max: usize,
     rate_windows: Arc<DashMap<String, VecDeque<DateTime<Utc>>>>,
     group_running: Arc<DashMap<String, AtomicU32>>,
+    job_completions: Arc<DashMap<String, JobCompletion>>,
 }
 
 impl SchedulerLoopContext {
@@ -843,6 +860,8 @@ impl SchedulerLoopContext {
             let dl = Arc::clone(&self.dead_letter);
             let dl_max = self.dead_letter_max;
             let gr = Arc::clone(&self.group_running);
+            let jc = Arc::clone(&self.job_completions);
+            let wakeup = Arc::clone(&self.wakeup_notify);
             tokio::spawn(async move {
                 while let Some(envelope) = rx.recv().await {
                     tracing::debug!(
@@ -937,6 +956,93 @@ impl SchedulerLoopContext {
                         &envelope.outcome,
                     );
                     eb.emit(&event);
+
+                    // -------------------------------------------------
+                    // DAG completion tracking + downstream triggering
+                    // -------------------------------------------------
+                    let status = match envelope.outcome {
+                        crate::model::JobOutcome::Success => Some(CompletionStatus::Success),
+                        crate::model::JobOutcome::Error(_) => Some(CompletionStatus::Failure),
+                        _ => None,
+                    };
+                    if let Some(status) = status {
+                        jc.insert(
+                            envelope.schedule_id.clone(),
+                            JobCompletion {
+                                schedule_id: envelope.schedule_id.clone(),
+                                last_run: envelope.completed_at,
+                                status,
+                            },
+                        );
+
+                        // Find any downstream jobs that declare this
+                        // schedule in their `depends_on` list, and if
+                        // *all* of their dependencies are satisfied,
+                        // trigger them by setting next_run_time = now.
+                        let mut triggered_any = false;
+                        for (_alias, store) in &store_snapshot {
+                            let all_jobs = match store.get_all_jobs().await {
+                                Ok(j) => j,
+                                Err(_) => continue,
+                            };
+                            for spec in all_jobs {
+                                if spec.depends_on.is_empty() {
+                                    continue;
+                                }
+                                if !spec.depends_on.contains(&envelope.schedule_id) {
+                                    continue;
+                                }
+                                // Check whether all dependencies are
+                                // satisfied.
+                                let mut satisfied = true;
+                                for dep in &spec.depends_on {
+                                    match jc.get(dep) {
+                                        Some(rec) => {
+                                            if rec.status == CompletionStatus::Failure
+                                                && !spec.run_on_failure
+                                            {
+                                                satisfied = false;
+                                                break;
+                                            }
+                                        }
+                                        None => {
+                                            satisfied = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !satisfied {
+                                    continue;
+                                }
+                                // Avoid re-triggering a job that is
+                                // already queued (next_run_time set).
+                                if spec.next_run_time.is_some() {
+                                    continue;
+                                }
+                                // Trigger: set next_run_time = now.
+                                let now = envelope.completed_at;
+                                if let Err(e) =
+                                    store.update_next_run_time(&spec.id, Some(now)).await
+                                {
+                                    tracing::warn!(
+                                        job_id = %spec.id,
+                                        "failed to trigger dependency: {}",
+                                        e
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        job_id = %spec.id,
+                                        upstream = %envelope.schedule_id,
+                                        "dependency satisfied, triggering downstream job"
+                                    );
+                                    triggered_any = true;
+                                }
+                            }
+                        }
+                        if triggered_any {
+                            wakeup.notify_one();
+                        }
+                    }
                 }
             });
         }
