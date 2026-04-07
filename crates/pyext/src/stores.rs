@@ -66,6 +66,39 @@ impl PySqlJobStore {
     }
 }
 
+/// Configuration for a MongoDB job store that will be created lazily.
+/// The actual MongoJobStore must be created within the scheduler's tokio runtime.
+#[pyclass(name = "MongoJobStore")]
+pub struct PyMongoJobStore {
+    pub(crate) uri: String,
+    pub(crate) database: String,
+    pub(crate) collection: String,
+}
+
+#[pymethods]
+impl PyMongoJobStore {
+    #[new]
+    #[pyo3(signature = (uri, database=None, collection=None))]
+    fn new(uri: &str, database: Option<&str>, collection: Option<&str>) -> PyResult<Self> {
+        Ok(Self {
+            uri: uri.to_string(),
+            database: database.unwrap_or("apscheduler").to_string(),
+            collection: collection.unwrap_or("jobs").to_string(),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MongoJobStore(uri={:?}, database={:?}, collection={:?})",
+            self.uri, self.database, self.collection
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+}
+
 /// Configuration for a Redis job store that will be created lazily.
 /// The actual RedisJobStore must be created within the scheduler's tokio runtime.
 #[pyclass(name = "RedisJobStore")]

@@ -235,6 +235,12 @@ pub enum TriggerState {
         timezone: String,
         /// Jitter in seconds.
         jitter: Option<f64>,
+        /// Optional sub-second precision: total interval in microseconds.
+        /// When `Some`, it overrides the integer component fields above for
+        /// the actual interval computation. Used to support fractional
+        /// (sub-second) intervals like 100ms.
+        #[serde(default)]
+        interval_micros: Option<i64>,
     },
     Cron {
         year: Option<String>,
@@ -291,17 +297,25 @@ impl TriggerState {
                 seconds,
                 end_date,
                 jitter,
+                interval_micros,
                 ..
             } => {
-                let total_secs = (*weeks) * 7 * 86400
-                    + (*days) * 86400
-                    + (*hours) * 3600
-                    + (*minutes) * 60
-                    + (*seconds);
-                if total_secs <= 0 {
-                    return None;
-                }
-                let interval = chrono::Duration::seconds(total_secs);
+                let interval = if let Some(micros) = interval_micros {
+                    if *micros <= 0 {
+                        return None;
+                    }
+                    chrono::Duration::microseconds(*micros)
+                } else {
+                    let total_secs = (*weeks) * 7 * 86400
+                        + (*days) * 86400
+                        + (*hours) * 3600
+                        + (*minutes) * 60
+                        + (*seconds);
+                    if total_secs <= 0 {
+                        return None;
+                    }
+                    chrono::Duration::seconds(total_secs)
+                };
                 // Advance by one interval step only.  The caller is
                 // responsible for skipping ahead further when
                 // coalescing is active.
@@ -376,17 +390,25 @@ impl TriggerState {
                 seconds,
                 end_date,
                 jitter,
+                interval_micros,
                 ..
             } => {
-                let total_secs = (*weeks) * 7 * 86400
-                    + (*days) * 86400
-                    + (*hours) * 3600
-                    + (*minutes) * 60
-                    + (*seconds);
-                if total_secs <= 0 {
-                    return None;
-                }
-                let interval = chrono::Duration::seconds(total_secs);
+                let interval = if let Some(micros) = interval_micros {
+                    if *micros <= 0 {
+                        return None;
+                    }
+                    chrono::Duration::microseconds(*micros)
+                } else {
+                    let total_secs = (*weeks) * 7 * 86400
+                        + (*days) * 86400
+                        + (*hours) * 3600
+                        + (*minutes) * 60
+                        + (*seconds);
+                    if total_secs <= 0 {
+                        return None;
+                    }
+                    chrono::Duration::seconds(total_secs)
+                };
                 let mut next = previous_fire_time + interval;
                 while next <= now {
                     next += interval;
@@ -652,6 +674,9 @@ pub struct JobChanges {
     pub paused: Option<bool>,
     pub executor: Option<String>,
     pub trigger_state: Option<TriggerState>,
+    /// Fully replace the task spec (used when args/kwargs change at runtime).
+    #[serde(default)]
+    pub task: Option<TaskSpec>,
 }
 
 impl JobChanges {
@@ -683,6 +708,9 @@ impl JobChanges {
         }
         if let Some(trigger_state) = self.trigger_state {
             spec.trigger_state = trigger_state;
+        }
+        if let Some(task) = self.task {
+            spec.task = task;
         }
         spec.version += 1;
     }
@@ -830,6 +858,7 @@ mod tests {
             end_date: None,
             timezone: "UTC".to_string(),
             jitter: Some(5.0),
+            interval_micros: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: TriggerState = serde_json::from_str(&json).unwrap();

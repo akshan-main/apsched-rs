@@ -1,6 +1,122 @@
 use pyo3::prelude::*;
 
-use apsched_core::event;
+use apsched_core::event::{self, SchedulerEvent};
+
+/// Construct the appropriate Python event object for a given core
+/// `SchedulerEvent`. Returns `JobExecutionEvent` for execution-related events,
+/// `JobEvent` for job lifecycle events, and `SchedulerEvent` otherwise — so
+/// listener callbacks can read fields like `.job_id`, `.exception`, etc.
+pub fn build_python_event(py: Python<'_>, event: &SchedulerEvent) -> PyResult<PyObject> {
+    let code = event.event_mask();
+    use SchedulerEvent::*;
+    match event {
+        JobExecuted {
+            schedule_id,
+            jobstore,
+            scheduled_run_time,
+            ..
+        } => {
+            let dt_obj = crate::convert::datetime_to_py(py, *scheduled_run_time)?;
+            let ev = PyJobExecutionEvent {
+                code,
+                alias: None,
+                job_id: schedule_id.clone(),
+                jobstore: jobstore.clone(),
+                scheduled_run_time: dt_obj,
+                retval: None,
+                exception: None,
+                traceback: None,
+            };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+        JobError {
+            schedule_id,
+            jobstore,
+            scheduled_run_time,
+            exception,
+            ..
+        } => {
+            let dt_obj = crate::convert::datetime_to_py(py, *scheduled_run_time)?;
+            let exc_str = pyo3::types::PyString::new(py, exception)
+                .into_any()
+                .unbind();
+            let ev = PyJobExecutionEvent {
+                code,
+                alias: None,
+                job_id: schedule_id.clone(),
+                jobstore: jobstore.clone(),
+                scheduled_run_time: dt_obj,
+                retval: None,
+                exception: Some(exc_str),
+                traceback: Some(exception.clone()),
+            };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+        JobMissed {
+            job_id,
+            jobstore,
+            scheduled_run_time,
+        } => {
+            let dt_obj = crate::convert::datetime_to_py(py, *scheduled_run_time)?;
+            let ev = PyJobExecutionEvent {
+                code,
+                alias: None,
+                job_id: job_id.clone(),
+                jobstore: jobstore.clone(),
+                scheduled_run_time: dt_obj,
+                retval: None,
+                exception: None,
+                traceback: None,
+            };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+        JobSubmitted {
+            schedule_id,
+            jobstore,
+            scheduled_run_time,
+            ..
+        } => {
+            let dt_obj = crate::convert::datetime_to_py(py, *scheduled_run_time)?;
+            let ev = PyJobExecutionEvent {
+                code,
+                alias: None,
+                job_id: schedule_id.clone(),
+                jobstore: jobstore.clone(),
+                scheduled_run_time: dt_obj,
+                retval: None,
+                exception: None,
+                traceback: None,
+            };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+        JobAdded { job_id, jobstore }
+        | JobRemoved { job_id, jobstore }
+        | JobModified { job_id, jobstore }
+        | JobMaxInstances { job_id, jobstore } => {
+            let ev = PyJobEvent {
+                code,
+                alias: None,
+                job_id: job_id.clone(),
+                jobstore: jobstore.clone(),
+            };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+        ExecutorAdded { alias }
+        | ExecutorRemoved { alias }
+        | JobStoreAdded { alias }
+        | JobStoreRemoved { alias } => {
+            let ev = PySchedulerEvent {
+                code,
+                alias: Some(alias.clone()),
+            };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+        _ => {
+            let ev = PySchedulerEvent { code, alias: None };
+            Ok(ev.into_pyobject(py)?.into_any().unbind())
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Event classes

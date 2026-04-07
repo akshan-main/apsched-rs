@@ -53,6 +53,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgre
 # Redis
 redis = { version = "0.27", features = ["aio", "tokio-comp", "connection-manager"] }
 
+# MongoDB
+mongodb = { version = "3", default-features = false, features = ["rustls-tls", "compat-3-0-0"] }
+bson = "2"
+
 # Serialization
 bincode = "1"
 ciborium = "0.2"

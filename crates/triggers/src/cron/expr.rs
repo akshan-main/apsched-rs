@@ -15,6 +15,34 @@ const MONTH_NAMES: &[&str] = &[
 /// Day-of-week names. APScheduler convention: MON=0 .. SUN=6.
 const DOW_NAMES: &[&str] = &["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
 
+/// Special markers extracted from the `day` field.
+///
+/// APScheduler supports:
+/// - `last` / `L` — last day of the month
+/// - `last <weekday>` (e.g. `last sun`) — last occurrence of `weekday` in the month
+/// - `<n>W` — nearest weekday (Mon-Fri) to day `n`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DaySpecial {
+    /// `last` or `L` — last day of the month.
+    LastDay,
+    /// `last <weekday>` — last occurrence of weekday (0=MON..6=SUN) in the month.
+    LastWeekday(u32),
+    /// `<n>W` — nearest weekday to day `n` in the month (stays within month).
+    NearestWeekday(u32),
+}
+
+/// Special markers extracted from the `day_of_week` field.
+///
+/// APScheduler supports `<weekday>#<n>` — the nth occurrence of `weekday` in the
+/// month (e.g. `6#3` = 3rd Saturday).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NthWeekday {
+    /// Weekday (0=MON..6=SUN).
+    pub weekday: u32,
+    /// Occurrence number in the month (1..=5).
+    pub nth: u32,
+}
+
 /// A fully compiled cron expression with matchers for every field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCronExpr {
@@ -25,6 +53,10 @@ pub struct CompiledCronExpr {
     pub months: FieldMatcher,
     pub weekdays: FieldMatcher,
     pub years: Option<FieldMatcher>,
+    /// Special day-of-month markers (`last`, `last sun`, `15W`).
+    pub day_special: Option<DaySpecial>,
+    /// Special day-of-week marker (`6#3`).
+    pub nth_weekday: Option<NthWeekday>,
 }
 
 impl CompiledCronExpr {
@@ -45,14 +77,17 @@ impl CompiledCronExpr {
         let seconds = parse_field(second, 0, 59, None, "second")?;
         let minutes = parse_field(minute, 0, 59, None, "minute")?;
         let hours = parse_field(hour, 0, 23, None, "hour")?;
-        let days = parse_field(day, 1, 31, None, "day")?;
+
+        // Extract day special markers (`last`, `last sun`, `15W`) before
+        // delegating to the generic parser, which does not understand them.
+        let (days, day_special) = parse_day_field(day)?;
 
         // For months, names map: JAN=0 in the parser, but we need JAN=1.
         // We handle this by creating a padded names array where index corresponds
         // to value-1, and add 1 to the result. Instead, let's use a custom approach:
         // parse with min=1,max=12 and use a names list offset by 1.
         let months = parse_month_field(month)?;
-        let weekdays = parse_dow_field(day_of_week)?;
+        let (weekdays, nth_weekday) = parse_dow_field_with_nth(day_of_week)?;
 
         let years = match year {
             Some(y) if !y.trim().is_empty() && y.trim() != "*" => {
@@ -69,6 +104,8 @@ impl CompiledCronExpr {
             months,
             weekdays,
             years,
+            day_special,
+            nth_weekday,
         })
     }
 
@@ -129,8 +166,10 @@ impl CompiledCronExpr {
             }
 
             // --- Day (of month AND/OR day of week) ---
-            let days_constrained = !self.days.is_all();
-            let dow_constrained = !self.weekdays.is_all();
+            // Special markers constrain the corresponding field even if the
+            // base matcher is wildcard.
+            let days_constrained = !self.days.is_all() || self.day_special.is_some();
+            let dow_constrained = !self.weekdays.is_all() || self.nth_weekday.is_some();
 
             let day_matched = {
                 let max_day = last_day_of_month(dt.year(), dt.month());
@@ -233,11 +272,38 @@ impl CompiledCronExpr {
         days_constrained: bool,
         dow_constrained: bool,
     ) -> Option<u32> {
+        // Pre-compute the day(s) selected by day-of-month specials.
+        // `day_special` either resolves to a single day within the month or
+        // to no day at all (e.g. `last fri` when no Friday exists — impossible
+        // for a real month, but the helper returns None gracefully).
+        let special_day = match self.day_special {
+            Some(DaySpecial::LastDay) => Some(max_day),
+            Some(DaySpecial::LastWeekday(wd)) => last_weekday_of_month(year, month, wd),
+            Some(DaySpecial::NearestWeekday(n)) => nearest_weekday(year, month, n, max_day),
+            None => None,
+        };
+        let has_dom_bits = !self.days.is_all();
+
+        // Pre-compute the nth weekday day, if configured.
+        let nth_day = self
+            .nth_weekday
+            .as_ref()
+            .and_then(|nw| nth_weekday_of_month(year, month, nw.weekday, nw.nth));
+        let has_dow_bits = !self.weekdays.is_all();
+
         for d in from_day..=max_day {
-            let dom_ok = self.days.matches(d);
             let date = NaiveDate::from_ymd_opt(year, month, d)?;
             let dow = apscheduler_weekday(date);
-            let dow_ok = self.weekdays.matches(dow);
+
+            // Day-of-month match: either from the explicit bit matcher or
+            // the special marker. If both are present they union.
+            let dom_ok =
+                (has_dom_bits && self.days.matches(d)) || special_day.is_some_and(|sd| sd == d);
+
+            // Day-of-week match: either from the explicit bit matcher or
+            // the nth-weekday special.
+            let dow_ok =
+                (has_dow_bits && self.weekdays.matches(dow)) || nth_day.is_some_and(|nd| nd == d);
 
             let matched = if days_constrained && dow_constrained {
                 // Union semantics (standard cron behavior).
@@ -255,6 +321,70 @@ impl CompiledCronExpr {
             }
         }
         None
+    }
+}
+
+/// Find the last occurrence of `weekday` (0=MON..6=SUN) in `year`/`month`.
+fn last_weekday_of_month(year: i32, month: u32, weekday: u32) -> Option<u32> {
+    let max_day = last_day_of_month(year, month);
+    for d in (1..=max_day).rev() {
+        let date = NaiveDate::from_ymd_opt(year, month, d)?;
+        if apscheduler_weekday(date) == weekday {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Find the nth occurrence (1..=5) of `weekday` (0=MON..6=SUN) in `year`/`month`.
+fn nth_weekday_of_month(year: i32, month: u32, weekday: u32, nth: u32) -> Option<u32> {
+    let max_day = last_day_of_month(year, month);
+    let mut count = 0u32;
+    for d in 1..=max_day {
+        let date = NaiveDate::from_ymd_opt(year, month, d)?;
+        if apscheduler_weekday(date) == weekday {
+            count += 1;
+            if count == nth {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Find the nearest weekday (Mon-Fri) to day `n` in `year`/`month`.
+///
+/// APScheduler/quartz semantics: if `n` falls on a weekday, return `n`. If it
+/// falls on Saturday, return Friday `n-1` (or the next Monday if that would
+/// cross into the previous month). If Sunday, return Monday `n+1` (or the
+/// previous Friday if that would cross into the next month).
+fn nearest_weekday(year: i32, month: u32, n: u32, max_day: u32) -> Option<u32> {
+    if n < 1 || n > max_day {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(year, month, n)?;
+    let dow = apscheduler_weekday(date);
+    match dow {
+        0..=4 => Some(n), // Mon..Fri
+        5 => {
+            // Saturday: step back to Friday, unless that leaves the month.
+            if n >= 2 {
+                Some(n - 1)
+            } else {
+                // n == 1 Saturday: jump forward to Monday (n + 2).
+                Some((n + 2).min(max_day))
+            }
+        }
+        6 => {
+            // Sunday: step forward to Monday, unless that leaves the month.
+            if n < max_day {
+                Some(n + 1)
+            } else {
+                // n is the last day and it's a Sunday: step back to Friday.
+                Some(n - 2)
+            }
+        }
+        _ => None,
     }
 }
 
@@ -346,10 +476,111 @@ fn parse_month_field(expr: Option<&str>) -> Result<FieldMatcher, TriggerError> {
 }
 
 /// Parse a day-of-week field, handling MON-SUN names. DOW: 0-6.
+#[allow(dead_code)]
 fn parse_dow_field(expr: Option<&str>) -> Result<FieldMatcher, TriggerError> {
     let expr = expr.unwrap_or("*");
     let replaced = replace_names(expr, DOW_NAMES, 0);
     parse_cron_field(&replaced, 0, 6, None)
+}
+
+/// Parse a day-of-week field, extracting any `<weekday>#<n>` marker.
+///
+/// Returns a matcher and an optional `NthWeekday`. If `#` is present the
+/// matcher is an empty bitset and the special marker drives selection.
+fn parse_dow_field_with_nth(
+    expr: Option<&str>,
+) -> Result<(FieldMatcher, Option<NthWeekday>), TriggerError> {
+    let raw = expr.unwrap_or("*").trim();
+
+    // Detect the `#` marker. APScheduler only supports a single term, not a
+    // comma list, for the nth-weekday form.
+    if raw.contains('#') {
+        let parts: Vec<&str> = raw.splitn(2, '#').collect();
+        if parts.len() != 2 {
+            return Err(TriggerError::InvalidCronExpression(format!(
+                "invalid nth-weekday expression: {}",
+                raw
+            )));
+        }
+        let wd_token = replace_names(parts[0].trim(), DOW_NAMES, 0);
+        let weekday = wd_token.parse::<u32>().map_err(|_| {
+            TriggerError::InvalidCronExpression(format!("invalid weekday in nth: {}", parts[0]))
+        })?;
+        if weekday > 6 {
+            return Err(TriggerError::InvalidCronExpression(format!(
+                "weekday out of range in nth: {}",
+                weekday
+            )));
+        }
+        let nth = parts[1].trim().parse::<u32>().map_err(|_| {
+            TriggerError::InvalidCronExpression(format!(
+                "invalid occurrence in nth-weekday: {}",
+                parts[1]
+            ))
+        })?;
+        if !(1..=5).contains(&nth) {
+            return Err(TriggerError::InvalidCronExpression(format!(
+                "nth occurrence must be in 1..=5, got {}",
+                nth
+            )));
+        }
+        return Ok((FieldMatcher::new(0, 6), Some(NthWeekday { weekday, nth })));
+    }
+
+    let replaced = replace_names(raw, DOW_NAMES, 0);
+    let matcher = parse_cron_field(&replaced, 0, 6, None)?;
+    Ok((matcher, None))
+}
+
+/// Parse a day-of-month field, extracting any special markers
+/// (`last`, `L`, `last <weekday>`, `<n>W`).
+///
+/// Returns a matcher and an optional `DaySpecial`. The matcher is empty when
+/// only a special marker is present.
+fn parse_day_field(expr: Option<&str>) -> Result<(FieldMatcher, Option<DaySpecial>), TriggerError> {
+    let raw = expr.unwrap_or("*").trim();
+    let lower = raw.to_ascii_lowercase();
+
+    // `last` or `L` — last day of the month.
+    if lower == "last" || lower == "l" {
+        return Ok((FieldMatcher::new(1, 31), Some(DaySpecial::LastDay)));
+    }
+
+    // `last <weekday>` — e.g. `last sun`, `last 5`, `last FRI`.
+    if let Some(rest) = lower.strip_prefix("last ") {
+        let token = rest.trim();
+        let replaced = replace_names(token, DOW_NAMES, 0);
+        let wd = replaced.parse::<u32>().map_err(|_| {
+            TriggerError::InvalidCronExpression(format!("invalid weekday in `last`: {}", token))
+        })?;
+        if wd > 6 {
+            return Err(TriggerError::InvalidCronExpression(format!(
+                "weekday out of range in `last`: {}",
+                wd
+            )));
+        }
+        return Ok((FieldMatcher::new(1, 31), Some(DaySpecial::LastWeekday(wd))));
+    }
+
+    // `<n>W` — nearest weekday to day `n`.
+    if let Some(num_part) = lower.strip_suffix('w') {
+        let n = num_part.trim().parse::<u32>().map_err(|_| {
+            TriggerError::InvalidCronExpression(format!("invalid day in `<n>W`: {}", num_part))
+        })?;
+        if !(1..=31).contains(&n) {
+            return Err(TriggerError::InvalidCronExpression(format!(
+                "day out of range in `<n>W`: {}",
+                n
+            )));
+        }
+        return Ok((
+            FieldMatcher::new(1, 31),
+            Some(DaySpecial::NearestWeekday(n)),
+        ));
+    }
+
+    let matcher = parse_cron_field(raw, 1, 31, None)?;
+    Ok((matcher, None))
 }
 
 /// Parse a generic field.
@@ -676,6 +907,296 @@ mod tests {
         let t = utc(2024, 6, 15, 12, 0, 0);
         let next = expr.get_next_fire_time(t, "UTC").unwrap();
         assert!(next > t, "next fire time must be strictly after `after`");
+    }
+
+    // ---------- L / W / # special markers ----------
+
+    #[test]
+    fn test_last_day_of_month_feb_leap() {
+        // `day="last"` in Feb 2024 (leap year) -> Feb 29.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("2"),
+            Some("last"),
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2024, 2, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2024, 2, 29, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_last_day_of_month_feb_non_leap() {
+        // `day="L"` in Feb 2023 -> Feb 28.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("2"),
+            Some("L"),
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2023, 2, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2023, 2, 28, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_last_day_rolls_across_months() {
+        // Every month last day. After Feb 28 2023 -> Mar 31.
+        let expr = CompiledCronExpr::compile(
+            None,
+            None,
+            Some("last"),
+            None,
+            None,
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2023, 2, 28, 12, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2023, 3, 31, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_last_weekday_last_sunday() {
+        // `day="last sun"` in June 2024.
+        // 2024-06-30 is a Sunday, so it's the last Sunday.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("6"),
+            Some("last sun"),
+            None,
+            None,
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2024, 6, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2024, 6, 30, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_last_weekday_last_friday_named() {
+        // Last Friday of January 2026. Jan 30 2026 is a Friday.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("1"),
+            Some("last fri"),
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 1, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 1, 30, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_nearest_weekday_15w_saturday() {
+        // 15W in August 2026: Aug 15 2026 is a Saturday -> Friday Aug 14.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("8"),
+            Some("15W"),
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 8, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 8, 14, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_nearest_weekday_15w_sunday() {
+        // 15W in February 2026: Feb 15 2026 is a Sunday -> Monday Feb 16.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("2"),
+            Some("15W"),
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 2, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 2, 16, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_nearest_weekday_15w_weekday() {
+        // 15W in Sept 2026: Sept 15 2026 is a Tuesday -> Sept 15 itself.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("9"),
+            Some("15W"),
+            None,
+            None,
+            Some("12"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 9, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 9, 15, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_nearest_weekday_1w_saturday_jumps_forward() {
+        // 1W: if day 1 is Saturday, normally we'd step back to Friday, but
+        // that would cross into the previous month; jump forward to Monday.
+        // August 2026: Aug 1 is a Saturday -> Monday Aug 3.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("8"),
+            Some("1W"),
+            None,
+            None,
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 7, 31, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 8, 3, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_nth_weekday_third_saturday() {
+        // APScheduler DOW: MON=0..SUN=6, so Saturday = 5.
+        // `day_of_week="5#3"` — third Saturday of January 2026.
+        // Jan 2026 Saturdays: 3, 10, 17, 24, 31 -> third = Jan 17.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("1"),
+            None,
+            None,
+            Some("5#3"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 1, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 1, 17, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_nth_weekday_third_sunday_via_6() {
+        // `6#3` — third Sunday of January 2026.
+        // Jan 2026 Sundays: 4, 11, 18, 25 -> third = Jan 18.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("1"),
+            None,
+            None,
+            Some("6#3"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 1, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 1, 18, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_nth_weekday_rolls_to_next_month() {
+        // `sat#3` starting after the third Saturday should roll to next month.
+        let expr = CompiledCronExpr::compile(
+            None,
+            None,
+            None,
+            None,
+            Some("sat#3"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        // Start after third Sat of Jan 2026 (Jan 17).
+        let after = utc(2026, 1, 18, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        // Feb 2026 Saturdays: 7, 14, 21, 28 -> third = Feb 21.
+        assert_eq!(next, utc(2026, 2, 21, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_nth_weekday_second_monday() {
+        // `0#2` — second Monday of March 2026. Mondays: 2, 9, 16, 23, 30 -> Mar 9.
+        let expr = CompiledCronExpr::compile(
+            None,
+            Some("3"),
+            None,
+            None,
+            Some("0#2"),
+            Some("9"),
+            Some("0"),
+            Some("0"),
+        )
+        .unwrap();
+        let after = utc(2026, 3, 1, 0, 0, 0);
+        let next = expr.get_next_fire_time(after, "UTC").unwrap();
+        assert_eq!(next, utc(2026, 3, 9, 9, 0, 0));
+    }
+
+    #[test]
+    fn test_invalid_nth_range() {
+        // #6 is out of range (1..=5).
+        let result =
+            CompiledCronExpr::compile(None, None, None, None, Some("0#6"), None, None, Some("0"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_w_range() {
+        let result =
+            CompiledCronExpr::compile(None, None, Some("32W"), None, None, None, None, Some("0"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_last_weekday_helper_fn() {
+        // 2024-06-30 is a Sunday.
+        assert_eq!(last_weekday_of_month(2024, 6, 6), Some(30));
+        // 2024-06-28 is a Friday (last Friday in June 2024).
+        assert_eq!(last_weekday_of_month(2024, 6, 4), Some(28));
+    }
+
+    #[test]
+    fn test_nth_weekday_helper_fn() {
+        // 3rd Saturday of Jan 2026 = Jan 17.
+        assert_eq!(nth_weekday_of_month(2026, 1, 5, 3), Some(17));
+        // 5th Saturday of Jan 2026 = Jan 31.
+        assert_eq!(nth_weekday_of_month(2026, 1, 5, 5), Some(31));
+        // 6th Saturday doesn't exist.
+        assert_eq!(nth_weekday_of_month(2026, 1, 5, 6), None);
     }
 
     #[test]

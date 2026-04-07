@@ -21,9 +21,20 @@ from apscheduler._rust import (
     EVENT_SCHEDULER_STARTED,
 )
 
+from apscheduler import util  # noqa: E402,F401  (re-export for compatibility)
+
 __version__ = "0.1.0"
 
+# APScheduler 3.x exposes the same version under ``release`` in some code
+# paths; we mirror it for maximum compatibility.
+release = __version__
+version_info = tuple(int(p) if p.isdigit() else p for p in __version__.split("."))
+
 __all__ = [
+    "util",
+    "release",
+    "version_info",
+    "__version__",
     "EVENT_ALL",
     "EVENT_ALL_JOBS_REMOVED",
     "EVENT_EXECUTOR_ADDED",

@@ -21,6 +21,9 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 sqlx = { workspace = true }
 redis = { workspace = true }
+mongodb = { workspace = true }
+bson = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

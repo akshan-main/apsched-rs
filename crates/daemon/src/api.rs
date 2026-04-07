@@ -594,6 +594,7 @@ pub fn config_to_trigger_state(trigger: &TriggerConfig) -> Result<TriggerState, 
                 end_date: None,
                 timezone: "UTC".to_string(),
                 jitter: None,
+                interval_micros: None,
             })
         }
         TriggerConfig::Date { run_date } => {

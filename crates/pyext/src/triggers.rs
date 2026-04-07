@@ -7,6 +7,45 @@ use apsched_triggers::{CalendarIntervalTrigger, CronTrigger, DateTrigger, Interv
 
 use crate::convert::{datetime_to_py, py_to_datetime};
 
+/// Extract a timezone string from a Python value that may be a string,
+/// `zoneinfo.ZoneInfo`, `pytz` timezone, `datetime.timezone`, or any object
+/// with a `key`/`zone` attribute or sensible `str()` representation.
+pub(crate) fn extract_timezone(tz: Option<&Bound<'_, PyAny>>) -> PyResult<String> {
+    let Some(tz) = tz else {
+        return Ok("UTC".to_string());
+    };
+    if tz.is_none() {
+        return Ok("UTC".to_string());
+    }
+    if let Ok(s) = tz.extract::<String>() {
+        return Ok(s);
+    }
+    // zoneinfo.ZoneInfo has a `.key` attribute
+    if let Ok(key_attr) = tz.getattr("key") {
+        if let Ok(s) = key_attr.extract::<String>() {
+            return Ok(s);
+        }
+    }
+    // pytz timezones expose a `.zone` attribute
+    if let Ok(zone_attr) = tz.getattr("zone") {
+        if let Ok(s) = zone_attr.extract::<String>() {
+            return Ok(s);
+        }
+    }
+    // datetime.timezone (fixed offsets) and others — fall back to str()
+    if let Ok(s) = tz.str() {
+        let val = s.to_string();
+        // datetime.timezone.utc → "UTC"
+        if val == "UTC" || val.starts_with("UTC") {
+            // For fixed UTC offsets like "UTC+05:00" we cannot easily map to a
+            // chrono-tz name; default to UTC. Users should pass named zones.
+            return Ok("UTC".to_string());
+        }
+        return Ok(val);
+    }
+    Ok("UTC".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // DateTrigger
 // ---------------------------------------------------------------------------
@@ -20,8 +59,11 @@ pub struct PyDateTrigger {
 impl PyDateTrigger {
     #[new]
     #[pyo3(signature = (run_date=None, timezone=None))]
-    fn new(run_date: Option<&Bound<'_, PyAny>>, timezone: Option<&str>) -> PyResult<Self> {
-        let tz = timezone.unwrap_or("UTC").to_string();
+    fn new(
+        run_date: Option<&Bound<'_, PyAny>>,
+        timezone: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let tz = extract_timezone(timezone)?;
         let dt = match run_date {
             Some(obj) => py_to_datetime(obj)?,
             None => Utc::now(),
@@ -76,20 +118,20 @@ pub struct PyIntervalTrigger {
 #[pymethods]
 impl PyIntervalTrigger {
     #[new]
-    #[pyo3(signature = (weeks=0, days=0, hours=0, minutes=0, seconds=0, start_date=None, end_date=None, timezone=None, jitter=None))]
+    #[pyo3(signature = (weeks=0.0, days=0.0, hours=0.0, minutes=0.0, seconds=0.0, start_date=None, end_date=None, timezone=None, jitter=None))]
     fn new(
         py: Python<'_>,
-        weeks: i64,
-        days: i64,
-        hours: i64,
-        minutes: i64,
-        seconds: i64,
+        weeks: f64,
+        days: f64,
+        hours: f64,
+        minutes: f64,
+        seconds: f64,
         start_date: Option<&Bound<'_, PyAny>>,
         end_date: Option<&Bound<'_, PyAny>>,
-        timezone: Option<&str>,
+        timezone: Option<&Bound<'_, PyAny>>,
         jitter: Option<f64>,
     ) -> PyResult<Self> {
-        let tz = timezone.unwrap_or("UTC").to_string();
+        let tz = extract_timezone(timezone)?;
         let sd = match start_date {
             Some(obj) => Some(py_to_datetime(obj)?),
             None => None,
@@ -99,16 +141,42 @@ impl PyIntervalTrigger {
             None => None,
         };
         let interval_secs =
-            (weeks * 7 * 86400 + days * 86400 + hours * 3600 + minutes * 60 + seconds) as f64;
+            weeks * 7.0 * 86400.0 + days * 86400.0 + hours * 3600.0 + minutes * 60.0 + seconds;
+        if interval_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "interval must be positive and non-zero",
+            ));
+        }
         // Pre-create a Python timedelta for fast prev + interval in get_next_fire_time
         let datetime_mod = py.import("datetime")?;
         let timedelta_cls = datetime_mod.getattr("timedelta")?;
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("seconds", interval_secs)?;
         let py_timedelta = timedelta_cls.call((), Some(&kwargs))?.unbind();
-        let trigger =
-            IntervalTrigger::new(weeks, days, hours, minutes, seconds, sd, ed, tz, jitter)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // If sub-second precision is needed, use the from_micros constructor.
+        let total_micros = (interval_secs * 1_000_000.0).round() as i64;
+        let has_fractional = (interval_secs.fract() != 0.0)
+            || weeks.fract() != 0.0
+            || days.fract() != 0.0
+            || hours.fract() != 0.0
+            || minutes.fract() != 0.0;
+        let trigger = if has_fractional {
+            IntervalTrigger::from_micros(total_micros, sd, ed, tz, jitter)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+        } else {
+            IntervalTrigger::new(
+                weeks as i64,
+                days as i64,
+                hours as i64,
+                minutes as i64,
+                seconds as i64,
+                sd,
+                ed,
+                tz,
+                jitter,
+            )
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+        };
         Ok(Self {
             inner: trigger,
             interval_secs,
@@ -173,7 +241,7 @@ impl PyCronTrigger {
         second: Option<&Bound<'_, PyAny>>,
         start_date: Option<&Bound<'_, PyAny>>,
         end_date: Option<&Bound<'_, PyAny>>,
-        timezone: Option<&str>,
+        timezone: Option<&Bound<'_, PyAny>>,
         jitter: Option<f64>,
     ) -> PyResult<Self> {
         // Helper: accept both str and int for cron fields, converting int to str
@@ -196,7 +264,7 @@ impl PyCronTrigger {
         let hour_s = pyany_to_cron_str(hour);
         let minute_s = pyany_to_cron_str(minute);
         let second_s = pyany_to_cron_str(second);
-        let tz = timezone.unwrap_or("UTC").to_string();
+        let tz = extract_timezone(timezone)?;
         let sd = match start_date {
             Some(obj) => Some(py_to_datetime(obj)?),
             None => None,
@@ -276,9 +344,9 @@ impl PyCalendarIntervalTrigger {
         second: u32,
         start_date: Option<&Bound<'_, PyAny>>,
         end_date: Option<&Bound<'_, PyAny>>,
-        timezone: Option<&str>,
+        timezone: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let tz = timezone.unwrap_or("UTC").to_string();
+        let tz = extract_timezone(timezone)?;
         let sd = match start_date {
             Some(obj) => Some(py_to_datetime(obj)?),
             None => None,

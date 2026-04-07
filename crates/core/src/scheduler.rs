@@ -1121,10 +1121,7 @@ impl SchedulerLoopContext {
         if let Some(ref rl) = schedule.rate_limit {
             let window = chrono::Duration::seconds(rl.window_seconds as i64);
             let cutoff = now - window;
-            let mut entry = self
-                .rate_windows
-                .entry(job_id.clone())
-                .or_default();
+            let mut entry = self.rate_windows.entry(job_id.clone()).or_default();
             // Evict old entries
             while entry.front().map(|t| *t < cutoff).unwrap_or(false) {
                 entry.pop_front();

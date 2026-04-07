@@ -32,6 +32,19 @@ class SQLAlchemyJobStore:
         tableschema: str | None = None,
         pickle_protocol: int = 2,
     ) -> None:
+        # APScheduler 3.x accepts either a URL or a pre-built SQLAlchemy
+        # engine. If an engine is supplied, extract its URL so the Rust
+        # backend can connect using its own connection pool.
+        if url is None and engine is not None:
+            engine_url = getattr(engine, "url", None)
+            if engine_url is None:
+                raise ValueError(
+                    "engine must be a SQLAlchemy Engine with a .url attribute"
+                )
+            url = str(engine_url)
+        if url is None:
+            raise ValueError("Need either `url` or `engine` to create SQLAlchemyJobStore")
+
         self.url = url
         self.tablename = tablename
         self.tableschema = tableschema

@@ -18,6 +18,7 @@ use apsched_core::model::{JobOutcome, JobResultEnvelope, JobSpec};
 use apsched_core::traits::{Executor, JobStore, Trigger};
 use apsched_core::SchedulerEngine;
 use apsched_store::MemoryJobStore;
+use apsched_store::MongoJobStore;
 use apsched_store::RedisJobStore;
 use apsched_store::SqlJobStore;
 
@@ -36,8 +37,19 @@ use crate::triggers::{PyCalendarIntervalTrigger, PyCronTrigger, PyDateTrigger, P
 /// connection pool runtime-binding issues.
 enum PendingStore {
     Memory(Arc<MemoryJobStore>),
-    Sql { url: String, tablename: String },
-    Redis { url: String, prefix: String },
+    Sql {
+        url: String,
+        tablename: String,
+    },
+    Redis {
+        url: String,
+        prefix: String,
+    },
+    Mongo {
+        uri: String,
+        database: String,
+        collection: String,
+    },
 }
 
 impl PendingStore {
@@ -58,6 +70,18 @@ impl PendingStore {
                     .block_on(RedisJobStore::new(&url, Some(&prefix)))
                     .map_err(|e| {
                         PyRuntimeError::new_err(format!("Failed to create Redis store: {}", e))
+                    })?;
+                Ok(Arc::new(store) as Arc<dyn JobStore>)
+            }
+            PendingStore::Mongo {
+                uri,
+                database,
+                collection,
+            } => {
+                let store = rt
+                    .block_on(MongoJobStore::new(&uri, Some(&database), Some(&collection)))
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("Failed to create MongoDB store: {}", e))
                     })?;
                 Ok(Arc::new(store) as Arc<dyn JobStore>)
             }
@@ -94,6 +118,57 @@ fn parse_jobstore(
             url: py_store.url.clone(),
             prefix: py_store.prefix.clone(),
         });
+    }
+    // Try PyMongoJobStore
+    if let Ok(py_store) = jobstore.extract::<PyRef<'_, crate::stores::PyMongoJobStore>>() {
+        return Ok(PendingStore::Mongo {
+            uri: py_store.uri.clone(),
+            database: py_store.database.clone(),
+            collection: py_store.collection.clone(),
+        });
+    }
+    // APScheduler 3.x compatibility wrappers (Python classes that delegate to
+    // a Rust store). These expose either an `_rust_store` attribute (e.g.
+    // SQLAlchemyJobStore) or a `.url`/`.tablename` pair on the Python object.
+    if let Ok(rust_store_attr) = jobstore.getattr("_rust_store") {
+        if !rust_store_attr.is_none() {
+            if let Ok(py_store) =
+                rust_store_attr.extract::<PyRef<'_, crate::stores::PySqlJobStore>>()
+            {
+                return Ok(PendingStore::Sql {
+                    url: py_store.url.clone(),
+                    tablename: py_store.tablename.clone(),
+                });
+            }
+            if let Ok(py_store) =
+                rust_store_attr.extract::<PyRef<'_, crate::stores::PyRedisJobStore>>()
+            {
+                return Ok(PendingStore::Redis {
+                    url: py_store.url.clone(),
+                    prefix: py_store.prefix.clone(),
+                });
+            }
+            if let Ok(py_store) =
+                rust_store_attr.extract::<PyRef<'_, crate::stores::PyMongoJobStore>>()
+            {
+                return Ok(PendingStore::Mongo {
+                    uri: py_store.uri.clone(),
+                    database: py_store.database.clone(),
+                    collection: py_store.collection.clone(),
+                });
+            }
+        }
+    }
+    // Fallback: duck-typed wrapper exposing `.url` (SQLAlchemyJobStore-like)
+    if let Ok(url_attr) = jobstore.getattr("url") {
+        if let Ok(url) = url_attr.extract::<String>() {
+            let tablename = jobstore
+                .getattr("tablename")
+                .ok()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_else(|| "apscheduler_jobs".to_string());
+            return Ok(PendingStore::Sql { url, tablename });
+        }
     }
     // Try string alias
     if let Ok(alias_str) = jobstore.extract::<String>() {
@@ -146,16 +221,56 @@ fn parse_jobstore(
                     .unwrap_or_else(|| "apscheduler:".to_string());
                 return Ok(PendingStore::Redis { url, prefix });
             }
+            "mongodb" | "mongo" => {
+                // Prefer an explicit `uri` (or `url`) kwarg; otherwise build
+                // one from host/port so APScheduler 3.x users can keep using
+                // `host=..., port=...`.
+                let uri_kwarg = kwargs
+                    .and_then(|kw| kw.get_item("uri").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .or_else(|| {
+                        kwargs
+                            .and_then(|kw| kw.get_item("url").ok().flatten())
+                            .and_then(|v| v.extract::<String>().ok())
+                    });
+                let uri = match uri_kwarg {
+                    Some(u) => u,
+                    None => {
+                        let host = kwargs
+                            .and_then(|kw| kw.get_item("host").ok().flatten())
+                            .and_then(|v| v.extract::<String>().ok())
+                            .unwrap_or_else(|| "localhost".to_string());
+                        let port = kwargs
+                            .and_then(|kw| kw.get_item("port").ok().flatten())
+                            .and_then(|v| v.extract::<u16>().ok())
+                            .unwrap_or(27017);
+                        format!("mongodb://{}:{}", host, port)
+                    }
+                };
+                let database = kwargs
+                    .and_then(|kw| kw.get_item("database").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_else(|| "apscheduler".to_string());
+                let collection = kwargs
+                    .and_then(|kw| kw.get_item("collection").ok().flatten())
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_else(|| "jobs".to_string());
+                return Ok(PendingStore::Mongo {
+                    uri,
+                    database,
+                    collection,
+                });
+            }
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "Unknown jobstore type: '{}'. Use 'memory', 'sqlite', 'sqlalchemy', 'postgresql', 'postgres', or 'redis'",
+                    "Unknown jobstore type: '{}'. Use 'memory', 'sqlite', 'sqlalchemy', 'postgresql', 'postgres', 'redis', 'mongodb', or 'mongo'",
                     other
                 )));
             }
         }
     }
     Err(PyTypeError::new_err(
-        "jobstore must be a MemoryJobStore, SqlJobStore, RedisJobStore, or a string alias ('memory', 'sqlite', 'sqlalchemy', 'postgresql', 'postgres', 'redis')",
+        "jobstore must be a MemoryJobStore, SqlJobStore, RedisJobStore, MongoJobStore, or a string alias ('memory', 'sqlite', 'sqlalchemy', 'postgresql', 'postgres', 'redis', 'mongodb', 'mongo')",
     ))
 }
 
@@ -353,6 +468,10 @@ pub struct PyJob {
     executor: String,
     #[pyo3(get)]
     jobstore: String,
+    #[pyo3(get)]
+    args: PyObject,
+    #[pyo3(get)]
+    kwargs: PyObject,
 }
 
 #[pymethods]
@@ -388,6 +507,17 @@ impl PyJob {
             TriggerState::CalendarInterval { .. } => Some("calendarinterval".to_string()),
             TriggerState::Plugin { description } => Some(description.clone()),
         };
+        // Deserialize args/kwargs so users can introspect them via job.args / job.kwargs.
+        // If deserialization fails (e.g. callable handle missing in this process),
+        // fall back to empty containers rather than failing the job lookup.
+        let (args_obj, kwargs_obj) =
+            match crate::convert::deserialize_py_args(py, &spec.task.args, &spec.task.kwargs) {
+                Ok((a, k)) => (a, k),
+                Err(_) => (
+                    PyTuple::empty(py).into_any().unbind(),
+                    PyDict::new(py).into_any().unbind(),
+                ),
+            };
         Ok(Self {
             id: spec.id.clone(),
             name: spec.name.clone(),
@@ -395,6 +525,8 @@ impl PyJob {
             trigger: trigger_desc,
             executor: spec.executor.clone(),
             jobstore: spec.jobstore.clone(),
+            args: args_obj,
+            kwargs: kwargs_obj,
         })
     }
 }
@@ -414,36 +546,34 @@ fn parse_trigger(
         return match trigger_str.as_str() {
             "date" => {
                 let run_date = args.and_then(|a| a.get_item("run_date").ok().flatten());
-                let timezone = args.and_then(|a| {
-                    a.get_item("timezone")
-                        .ok()
-                        .flatten()
-                        .and_then(|v| v.extract::<String>().ok())
-                });
-                let tz = timezone.as_deref().unwrap_or("UTC");
+                let tz = args
+                    .and_then(|a| a.get_item("timezone").ok().flatten())
+                    .map(|v| crate::triggers::extract_timezone(Some(&v)))
+                    .transpose()?
+                    .unwrap_or_else(|| "UTC".to_string());
                 let dt = match run_date {
                     Some(ref obj) => py_to_datetime(obj)?,
                     None => Utc::now(),
                 };
-                let t = apsched_triggers::DateTrigger::new(dt, tz.to_string())
+                let t = apsched_triggers::DateTrigger::new(dt, tz)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
                 Ok(Box::new(t))
             }
             "interval" => {
-                let get_i64 = |key: &str, default: i64| -> i64 {
+                let get_f64 = |key: &str, default: f64| -> f64 {
                     args.and_then(|a| {
                         a.get_item(key)
                             .ok()
                             .flatten()
-                            .and_then(|v| v.extract::<i64>().ok())
+                            .and_then(|v| v.extract::<f64>().ok())
                     })
                     .unwrap_or(default)
                 };
-                let weeks = get_i64("weeks", 0);
-                let days = get_i64("days", 0);
-                let hours = get_i64("hours", 0);
-                let minutes = get_i64("minutes", 0);
-                let seconds = get_i64("seconds", 0);
+                let weeks = get_f64("weeks", 0.0);
+                let days = get_f64("days", 0.0);
+                let hours = get_f64("hours", 0.0);
+                let minutes = get_f64("minutes", 0.0);
+                let seconds = get_f64("seconds", 0.0);
                 let start_date = args
                     .and_then(|a| a.get_item("start_date").ok().flatten())
                     .map(|obj| py_to_datetime(&obj))
@@ -453,12 +583,9 @@ fn parse_trigger(
                     .map(|obj| py_to_datetime(&obj))
                     .transpose()?;
                 let timezone = args
-                    .and_then(|a| {
-                        a.get_item("timezone")
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.extract::<String>().ok())
-                    })
+                    .and_then(|a| a.get_item("timezone").ok().flatten())
+                    .map(|v| crate::triggers::extract_timezone(Some(&v)))
+                    .transpose()?
                     .unwrap_or_else(|| "UTC".to_string());
                 let jitter = args.and_then(|a| {
                     a.get_item("jitter")
@@ -467,10 +594,45 @@ fn parse_trigger(
                         .and_then(|v| v.extract::<f64>().ok())
                 });
 
-                let t = apsched_triggers::IntervalTrigger::new(
-                    weeks, days, hours, minutes, seconds, start_date, end_date, timezone, jitter,
-                )
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let total_secs = weeks * 7.0 * 86400.0
+                    + days * 86400.0
+                    + hours * 3600.0
+                    + minutes * 60.0
+                    + seconds;
+                if total_secs <= 0.0 {
+                    return Err(PyValueError::new_err(
+                        "interval must be positive and non-zero",
+                    ));
+                }
+                let has_fractional = total_secs.fract() != 0.0
+                    || weeks.fract() != 0.0
+                    || days.fract() != 0.0
+                    || hours.fract() != 0.0
+                    || minutes.fract() != 0.0;
+                let t = if has_fractional {
+                    let total_micros = (total_secs * 1_000_000.0).round() as i64;
+                    apsched_triggers::IntervalTrigger::from_micros(
+                        total_micros,
+                        start_date,
+                        end_date,
+                        timezone,
+                        jitter,
+                    )
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+                } else {
+                    apsched_triggers::IntervalTrigger::new(
+                        weeks as i64,
+                        days as i64,
+                        hours as i64,
+                        minutes as i64,
+                        seconds as i64,
+                        start_date,
+                        end_date,
+                        timezone,
+                        jitter,
+                    )
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+                };
                 Ok(Box::new(t))
             }
             "cron" => {
@@ -503,7 +665,11 @@ fn parse_trigger(
                     .and_then(|a| a.get_item("end_date").ok().flatten())
                     .map(|obj| py_to_datetime(&obj))
                     .transpose()?;
-                let timezone = get_str("timezone").unwrap_or_else(|| "UTC".to_string());
+                let timezone = args
+                    .and_then(|a| a.get_item("timezone").ok().flatten())
+                    .map(|v| crate::triggers::extract_timezone(Some(&v)))
+                    .transpose()?
+                    .unwrap_or_else(|| "UTC".to_string());
                 let jitter = args.and_then(|a| {
                     a.get_item("jitter")
                         .ok()
@@ -563,12 +729,9 @@ fn parse_trigger(
                     .map(|obj| py_to_datetime(&obj))
                     .transpose()?;
                 let timezone = args
-                    .and_then(|a| {
-                        a.get_item("timezone")
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.extract::<String>().ok())
-                    })
+                    .and_then(|a| a.get_item("timezone").ok().flatten())
+                    .map(|v| crate::triggers::extract_timezone(Some(&v)))
+                    .transpose()?
                     .unwrap_or_else(|| "UTC".to_string());
 
                 let t = apsched_triggers::CalendarIntervalTrigger::new(
@@ -1230,10 +1393,13 @@ impl PyBlockingScheduler {
             // We wrap the Python callback in a Rust closure that acquires the GIL
             engine.add_listener(
                 Arc::new(move |event: &SchedulerEvent| {
-                    Python::with_gil(|py| {
-                        let code = event.event_mask();
-                        let py_event = crate::events::PySchedulerEvent::new(code, None);
-                        let _ = cb.bind(py).call1((py_event,));
+                    Python::with_gil(|py| match crate::events::build_python_event(py, event) {
+                        Ok(py_event) => {
+                            let _ = cb.bind(py).call1((py_event,));
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to build python event: {}", e);
+                        }
                     });
                 }),
                 listener_mask,
@@ -1679,10 +1845,13 @@ impl PyBlockingScheduler {
             let cb = callback;
             engine.add_listener(
                 Arc::new(move |event: &SchedulerEvent| {
-                    Python::with_gil(|py| {
-                        let code = event.event_mask();
-                        let py_event = crate::events::PySchedulerEvent::new(code, None);
-                        let _ = cb.bind(py).call1((py_event,));
+                    Python::with_gil(|py| match crate::events::build_python_event(py, event) {
+                        Ok(py_event) => {
+                            let _ = cb.bind(py).call1((py_event,));
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to build python event: {}", e);
+                        }
                     });
                 }),
                 mask,
@@ -2001,12 +2170,6 @@ impl PyBackgroundScheduler {
             Arc::new(apsched_core::WallClock),
         ));
 
-        // Add default store
-        let default_store = Arc::new(MemoryJobStore::new());
-        engine
-            .add_jobstore(default_store, "default")
-            .map_err(scheduler_error_to_pyerr)?;
-
         // Add default executor (Python-aware so it can invoke Python callables)
         let callable_store = Arc::clone(&self.callable_store);
         let default_executor = Arc::new(PythonAwareExecutor::new(Arc::clone(&callable_store), 10));
@@ -2014,7 +2177,11 @@ impl PyBackgroundScheduler {
             .add_executor(default_executor, "default")
             .map_err(scheduler_error_to_pyerr)?;
 
-        // Add user stores (pending stores, materialized with this runtime)
+        // Add user stores (pending stores, materialized with this runtime).
+        // User-supplied "default" alias takes precedence over the builtin
+        // default memory store.
+        let user_has_default =
+            self.pending_stores.contains_key("default") || self.stores.contains_key("default");
         for (alias, pending) in self.pending_stores.drain() {
             let store = pending.into_store(&rt)?;
             engine
@@ -2030,6 +2197,14 @@ impl PyBackgroundScheduler {
                     .add_jobstore(store, alias)
                     .map_err(scheduler_error_to_pyerr)?;
             }
+        }
+
+        // Add default memory store only if user did not supply one.
+        if !user_has_default {
+            let default_store = Arc::new(MemoryJobStore::new());
+            engine
+                .add_jobstore(default_store, "default")
+                .map_err(scheduler_error_to_pyerr)?;
         }
 
         // Add user executors
@@ -2054,10 +2229,13 @@ impl PyBackgroundScheduler {
             let listener_mask = *mask;
             engine.add_listener(
                 Arc::new(move |event: &SchedulerEvent| {
-                    Python::with_gil(|py| {
-                        let code = event.event_mask();
-                        let py_event = crate::events::PySchedulerEvent::new(code, None);
-                        let _ = cb.bind(py).call1((py_event,));
+                    Python::with_gil(|py| match crate::events::build_python_event(py, event) {
+                        Ok(py_event) => {
+                            let _ = cb.bind(py).call1((py_event,));
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to build python event: {}", e);
+                        }
                     });
                 }),
                 listener_mask,
@@ -2111,18 +2289,29 @@ impl PyBackgroundScheduler {
         let wait = wait.unwrap_or(true);
         self.shutdown_flag.store(true, Ordering::Relaxed);
 
-        if let Some(handle) = self.background_thread.take() {
-            handle.thread().unpark();
-            if wait {
-                py.allow_threads(|| {
-                    let _ = handle.join();
-                });
-            }
-        }
-
+        // Take ownership so we can drop the runtime/engine outside the GIL.
+        // Dropping a tokio Runtime blocks until in-flight tasks finish; if a
+        // job task is parked on Python::with_gil and we hold the GIL, that
+        // produces a deadlock. We must release the GIL across the drop.
+        let handle = self.background_thread.take();
+        let runtime = self.runtime.take();
+        let engine = self.engine.take();
         self.started = false;
-        self.engine = None;
-        self.runtime = None;
+
+        py.allow_threads(move || {
+            if let Some(handle) = handle {
+                handle.thread().unpark();
+                if wait {
+                    let _ = handle.join();
+                }
+            }
+            // Explicitly drop in this scope so the runtime is shut down
+            // while the GIL is released and any pending Python::with_gil
+            // calls in worker tasks can proceed.
+            drop(engine);
+            drop(runtime);
+        });
+
         Ok(())
     }
 
@@ -2135,6 +2324,12 @@ impl PyBackgroundScheduler {
         trigger_args: Option<&Bound<'_, PyDict>>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
+        // Reject jobs submitted after shutdown to prevent silent drops.
+        if !self.started && self.engine.is_none() && self.shutdown_flag.load(Ordering::Relaxed) {
+            return Err(PyRuntimeError::new_err(
+                "scheduler has been shut down; cannot add new jobs",
+            ));
+        }
         let spec = build_schedule_spec(
             py,
             func,
@@ -2159,12 +2354,32 @@ impl PyBackgroundScheduler {
                 let engine = Arc::clone(engine);
                 let rt = Arc::clone(rt);
                 let spec_clone = spec;
-                rt.block_on(async {
-                    engine
-                        .add_job(spec_clone)
-                        .await
-                        .map_err(scheduler_error_to_pyerr)
-                })?;
+                // If we're being called from inside a running job (i.e. on a
+                // tokio worker thread), calling `rt.block_on` on the same
+                // runtime would panic. Detect that and drive the future on a
+                // dedicated OS thread instead.
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    let handle = rt.handle().clone();
+                    let join = std::thread::spawn(move || {
+                        handle.block_on(async {
+                            engine.add_job(spec_clone).await.map_err(|e| e.to_string())
+                        })
+                    });
+                    match join.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(msg)) => return Err(PyRuntimeError::new_err(msg)),
+                        Err(_) => {
+                            return Err(PyRuntimeError::new_err("add_job worker thread panicked"))
+                        }
+                    }
+                } else {
+                    rt.block_on(async {
+                        engine
+                            .add_job(spec_clone)
+                            .await
+                            .map_err(scheduler_error_to_pyerr)
+                    })?;
+                }
             }
         } else {
             self.pending_jobs.push(PendingJob { spec });
@@ -2273,7 +2488,22 @@ impl PyBackgroundScheduler {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
         if let (Some(ref engine), Some(ref rt)) = (&self.engine, &self.runtime) {
+            // We need the existing spec so we can clone its task and selectively
+            // overwrite args/kwargs while preserving the callable reference.
+            let engine_arc = Arc::clone(engine);
+            let rt_arc = Arc::clone(rt);
+            let job_id_owned = job_id.to_string();
+            let jobstore_owned = jobstore.map(|s| s.to_string());
+            let existing = rt_arc.block_on(async {
+                engine_arc
+                    .get_job(&job_id_owned, jobstore_owned.as_deref())
+                    .await
+                    .map_err(scheduler_error_to_pyerr)
+            })?;
+
             let mut changes = apsched_core::model::JobChanges::default();
+            let mut new_task = existing.task.clone();
+            let mut task_changed = false;
             if let Some(kw) = kwargs {
                 if let Some(name) = kw
                     .get_item("name")?
@@ -2287,6 +2517,27 @@ impl PyBackgroundScheduler {
                 {
                     changes.max_instances = Some(max);
                 }
+                if let Some(args_obj) = kw.get_item("args")? {
+                    let tup = if let Ok(t) = args_obj.downcast::<PyTuple>() {
+                        t.clone()
+                    } else {
+                        PyTuple::new(py, args_obj.try_iter()?.collect::<PyResult<Vec<_>>>()?)?
+                    };
+                    let (ser_args, _) = crate::convert::serialize_py_args(py, &tup, None)?;
+                    new_task.args = ser_args;
+                    task_changed = true;
+                }
+                if let Some(kwargs_obj) = kw.get_item("kwargs")? {
+                    if let Ok(d) = kwargs_obj.downcast::<PyDict>() {
+                        let (_, ser_kwargs) =
+                            crate::convert::serialize_py_args(py, &PyTuple::empty(py), Some(d))?;
+                        new_task.kwargs = ser_kwargs;
+                        task_changed = true;
+                    }
+                }
+            }
+            if task_changed {
+                changes.task = Some(new_task);
             }
 
             let engine = Arc::clone(engine);
@@ -2326,6 +2577,25 @@ impl PyBackgroundScheduler {
             let rt = Arc::clone(rt);
             let job_id_owned = job_id.to_string();
             let jobstore_owned = jobstore.map(|s| s.to_string());
+
+            // Reentrant safe: if called from within a job running on the
+            // tokio runtime, drive the future on a separate OS thread.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let handle = rt.handle().clone();
+                let join = std::thread::spawn(move || {
+                    handle.block_on(async {
+                        engine
+                            .remove_job(&job_id_owned, jobstore_owned.as_deref())
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                });
+                return match join.join() {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(msg)) => Err(pyo3::exceptions::PyKeyError::new_err(msg)),
+                    Err(_) => Err(PyRuntimeError::new_err("remove_job worker thread panicked")),
+                };
+            }
 
             rt.block_on(async {
                 engine
@@ -2546,10 +2816,13 @@ impl PyBackgroundScheduler {
             let cb = callback;
             engine.add_listener(
                 Arc::new(move |event: &SchedulerEvent| {
-                    Python::with_gil(|py| {
-                        let code = event.event_mask();
-                        let py_event = crate::events::PySchedulerEvent::new(code, None);
-                        let _ = cb.bind(py).call1((py_event,));
+                    Python::with_gil(|py| match crate::events::build_python_event(py, event) {
+                        Ok(py_event) => {
+                            let _ = cb.bind(py).call1((py_event,));
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to build python event: {}", e);
+                        }
                     });
                 }),
                 mask,
@@ -2898,10 +3171,13 @@ impl PyAsyncIOScheduler {
             let listener_mask = *mask;
             engine.add_listener(
                 Arc::new(move |event: &SchedulerEvent| {
-                    Python::with_gil(|py| {
-                        let code = event.event_mask();
-                        let py_event = crate::events::PySchedulerEvent::new(code, None);
-                        let _ = cb.bind(py).call1((py_event,));
+                    Python::with_gil(|py| match crate::events::build_python_event(py, event) {
+                        Ok(py_event) => {
+                            let _ = cb.bind(py).call1((py_event,));
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to build python event: {}", e);
+                        }
                     });
                 }),
                 listener_mask,
@@ -2934,12 +3210,18 @@ impl PyAsyncIOScheduler {
     #[pyo3(signature = (wait=None))]
     fn shutdown(&mut self, py: Python<'_>, wait: Option<bool>) -> PyResult<()> {
         let wait = wait.unwrap_or(true);
-        if let (Some(engine), Some(rt)) = (self.engine.take(), self.runtime.take()) {
-            rt.block_on(async {
-                let _ = engine.shutdown(wait).await;
-            });
-        }
+        let engine = self.engine.take();
+        let runtime = self.runtime.take();
         self.started = false;
+        py.allow_threads(move || {
+            if let (Some(engine), Some(rt)) = (engine, runtime) {
+                rt.block_on(async {
+                    let _ = engine.shutdown(wait).await;
+                });
+                // Drop the runtime in this scope (GIL released) so any in-flight
+                // job tasks waiting on Python::with_gil can complete cleanly.
+            }
+        });
         Ok(())
     }
 
@@ -3079,10 +3361,13 @@ impl PyAsyncIOScheduler {
             let cb = callback;
             engine.add_listener(
                 Arc::new(move |event: &SchedulerEvent| {
-                    Python::with_gil(|py| {
-                        let code = event.event_mask();
-                        let py_event = crate::events::PySchedulerEvent::new(code, None);
-                        let _ = cb.bind(py).call1((py_event,));
+                    Python::with_gil(|py| match crate::events::build_python_event(py, event) {
+                        Ok(py_event) => {
+                            let _ = cb.bind(py).call1((py_event,));
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to build python event: {}", e);
+                        }
                     });
                 }),
                 mask,

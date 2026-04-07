@@ -24,6 +24,10 @@ pub struct IntervalTrigger {
     hours: i64,
     minutes: i64,
     seconds: i64,
+    /// When set, interval is sub-second precision: total microseconds.
+    /// This overrides the integer components above for fire-time arithmetic.
+    #[serde(default)]
+    interval_micros: Option<i64>,
 }
 
 mod duration_serde {
@@ -80,6 +84,42 @@ impl IntervalTrigger {
             hours,
             minutes,
             seconds,
+            interval_micros: None,
+        })
+    }
+
+    /// Create an `IntervalTrigger` from a precise total microsecond interval.
+    /// This is the entry point used when sub-second precision is required
+    /// (e.g. 100ms intervals from Python).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_micros(
+        total_micros: i64,
+        start_date: Option<DateTime<Utc>>,
+        end_date: Option<DateTime<Utc>>,
+        timezone: String,
+        jitter: Option<f64>,
+    ) -> Result<Self, TriggerError> {
+        timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+            TriggerError::InvalidInterval(format!("invalid timezone: {}", timezone))
+        })?;
+        if total_micros <= 0 {
+            return Err(TriggerError::InvalidInterval(
+                "interval must be positive and non-zero".to_string(),
+            ));
+        }
+        let total_secs_floor = total_micros / 1_000_000;
+        Ok(Self {
+            interval: Duration::microseconds(total_micros),
+            start_date,
+            end_date,
+            timezone,
+            jitter_secs: jitter,
+            weeks: 0,
+            days: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: total_secs_floor,
+            interval_micros: Some(total_micros),
         })
     }
 
@@ -166,6 +206,7 @@ impl Trigger for IntervalTrigger {
             end_date: self.end_date,
             timezone: self.timezone.clone(),
             jitter: self.jitter_secs,
+            interval_micros: self.interval_micros,
         }
     }
 

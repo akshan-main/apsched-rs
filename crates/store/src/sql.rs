@@ -46,6 +46,61 @@ impl SqlJobStore {
 
         let backend = Self::detect_backend(database_url)?;
 
+        // Normalize URL for SQLAlchemy compatibility. SQLAlchemy uses
+        // `sqlite:///relative.db` (3 slashes, relative) and
+        // `sqlite:////absolute.db` (4 slashes, absolute). sqlx expects
+        // `sqlite:filename` or `sqlite://absolute/path`. Translate.
+        //
+        // Also map SQLAlchemy in-memory forms (`sqlite:///:memory:`,
+        // `sqlite://:memory:`) to sqlx's canonical `sqlite::memory:`.
+        let normalized_url: String =
+            if backend == DbBackend::Sqlite && database_url.contains(":memory:") {
+                "sqlite::memory:".to_string()
+            } else if backend == DbBackend::Sqlite && !database_url.contains(":memory:") {
+                let rest = database_url.trim_start_matches("sqlite:");
+                // Count leading slashes
+                let mut slashes = 0usize;
+                for c in rest.chars() {
+                    if c == '/' {
+                        slashes += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let path_part = &rest[slashes..];
+                match slashes {
+                    // `sqlite:foo.db` - relative, pass through
+                    0 => database_url.to_string(),
+                    // `sqlite:/foo.db` - absolute? treat as relative-rooted path
+                    1 => format!("sqlite:///{}", path_part),
+                    // `sqlite://foo.db` - relative (no authority); pass through
+                    2 => database_url.to_string(),
+                    // `sqlite:///foo/bar` - SQLAlchemy absolute form; sqlx expects this
+                    3 => database_url.to_string(),
+                    // `sqlite:////foo/bar` - SQLAlchemy extra-slash absolute;
+                    // collapse to 3 slashes for sqlx.
+                    _ => format!("sqlite:///{}", path_part),
+                }
+            } else {
+                database_url.to_string()
+            };
+        // Ensure sqlite creates the database file if it does not exist.
+        // sqlx defaults to read-only open, which errors with "unable to open
+        // database file" when the file is absent. Append ?mode=rwc.
+        let normalized_url = if backend == DbBackend::Sqlite
+            && !normalized_url.contains(":memory:")
+            && !normalized_url.contains("mode=")
+        {
+            if normalized_url.contains('?') {
+                format!("{}&mode=rwc", normalized_url)
+            } else {
+                format!("{}?mode=rwc", normalized_url)
+            }
+        } else {
+            normalized_url
+        };
+        let database_url = normalized_url.as_str();
+
         // For in-memory SQLite, limit to 1 connection so all queries
         // share the same in-memory database.
         let max_conns = if database_url.contains(":memory:") {
@@ -1195,6 +1250,7 @@ mod tests {
             end_date: None,
             timezone: "UTC".to_string(),
             jitter: Some(5.0),
+            interval_micros: None,
         };
 
         let mut spec = ScheduleSpec::new("interval_job", sample_task(), trigger);
